@@ -52,13 +52,17 @@ type TablebasePool struct {
 	// Refutation config
 	refutationDepth int // Search depth for refutation (deeper than normal eval)
 
+	// Worker control
+	activeWorkers int32 // atomic: number of workers that should be active (0 = paused)
+	maxWorkers    int32 // configured maximum workers
+
 	// Stats
-	expanded        int64
-	evaluated       int64
-	browseEvaled    int64 // Positions evaluated from browse queue
+	expanded         int64
+	evaluated        int64
+	browseEvaled     int64 // Positions evaluated from browse queue
 	refutationEvaled int64 // Positions evaluated from refutation queue
-	matesProved     int64 // Mates proved by refutation
-	currentDepth    int32
+	matesProved      int64 // Mates proved by refutation
+	currentDepth     int32
 }
 
 // NewTablebasePool creates a new tablebase evaluation pool.
@@ -98,7 +102,53 @@ func NewTablebasePool(cfg TablebasePoolConfig, ps *store.PositionStore) (*Tableb
 		browseQueue:     NewBrowseQueue(10000), // Priority queue for user-browsed positions
 		refutationQueue: make(chan RefutationJob, 1000),
 		refutationDepth: refuteDepth,
+		activeWorkers:   int32(cfg.NumWorkers), // Start with all workers active
+		maxWorkers:      int32(cfg.NumWorkers),
 	}, nil
+}
+
+// EvalStatus represents the current status of the eval pool.
+type EvalStatus struct {
+	ActiveWorkers    int   `json:"active_workers"`
+	MaxWorkers       int   `json:"max_workers"`
+	BrowseQueueLen   int   `json:"browse_queue_len"`
+	RefuteQueueLen   int   `json:"refute_queue_len"`
+	WorkQueueLen     int   `json:"work_queue_len"`
+	Evaluated        int64 `json:"evaluated"`
+	BrowseEvaled     int64 `json:"browse_evaled"`
+	RefutationEvaled int64 `json:"refutation_evaled"`
+	MatesProved      int64 `json:"mates_proved"`
+	CurrentDepth     int   `json:"current_depth"`
+}
+
+// GetStatus returns the current status of the eval pool.
+func (p *TablebasePool) GetStatus() EvalStatus {
+	return EvalStatus{
+		ActiveWorkers:    int(atomic.LoadInt32(&p.activeWorkers)),
+		MaxWorkers:       int(p.maxWorkers),
+		BrowseQueueLen:   p.browseQueue.Len(),
+		RefuteQueueLen:   len(p.refutationQueue),
+		WorkQueueLen:     len(p.workQueue),
+		Evaluated:        atomic.LoadInt64(&p.evaluated),
+		BrowseEvaled:     atomic.LoadInt64(&p.browseEvaled),
+		RefutationEvaled: atomic.LoadInt64(&p.refutationEvaled),
+		MatesProved:      atomic.LoadInt64(&p.matesProved),
+		CurrentDepth:     int(atomic.LoadInt32(&p.currentDepth)),
+	}
+}
+
+// SetActiveWorkers sets the number of active workers (0 = paused, max = all).
+// Returns the new active count.
+func (p *TablebasePool) SetActiveWorkers(n int) int {
+	if n < 0 {
+		n = 0
+	}
+	if n > int(p.maxWorkers) {
+		n = int(p.maxWorkers)
+	}
+	old := atomic.SwapInt32(&p.activeWorkers, int32(n))
+	p.log.Info().Int("old", int(old)).Int("new", n).Msg("set active workers")
+	return n
 }
 
 // BrowseQueue returns the browse queue for external enqueuing.
@@ -409,6 +459,18 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 			log.Info().Msg("worker stopping (context cancelled)")
 			return
 		default:
+		}
+
+		// Check if this worker should be active
+		// Workers with ID >= activeWorkers sleep until activated
+		for int32(workerID) >= atomic.LoadInt32(&p.activeWorkers) {
+			select {
+			case <-ctx.Done():
+				log.Info().Msg("worker stopping (context cancelled while paused)")
+				return
+			case <-time.After(500 * time.Millisecond):
+				// Check again
+			}
 		}
 
 		// Check browse queue first (highest priority)

@@ -44,6 +44,8 @@ func NewRouter(log zerolog.Logger, ps *store.PositionStore, evalPool *eval.Table
 	mux.Handle("/v1/tree/", http.HandlerFunc(h.tree))
 	mux.Handle("/v1/fen", http.HandlerFunc(h.fenLookup))
 	mux.Handle("/v1/stats", http.HandlerFunc(h.stats))
+	mux.Handle("/v1/eval/status", http.HandlerFunc(h.evalStatus))
+	mux.Handle("/v1/eval/workers", http.HandlerFunc(h.evalWorkers))
 
 	// pprof endpoints
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -566,6 +568,84 @@ func mvToSAN(pos *pgn.GameState, mv pgn.Mv) string {
 	}
 
 	return san
+}
+
+// evalStatus returns the current eval pool status
+func (h *Handler) evalStatus(w http.ResponseWriter, r *http.Request) {
+	if h.evalPool == nil {
+		writeJSON(w, map[string]any{
+			"enabled": false,
+			"error":   "eval pool not configured",
+		})
+		return
+	}
+
+	status := h.evalPool.GetStatus()
+	writeJSON(w, map[string]any{
+		"enabled":           true,
+		"active_workers":    status.ActiveWorkers,
+		"max_workers":       status.MaxWorkers,
+		"browse_queue_len":  status.BrowseQueueLen,
+		"refute_queue_len":  status.RefuteQueueLen,
+		"work_queue_len":    status.WorkQueueLen,
+		"evaluated":         status.Evaluated,
+		"browse_evaled":     status.BrowseEvaled,
+		"refutation_evaled": status.RefutationEvaled,
+		"mates_proved":      status.MatesProved,
+		"current_depth":     status.CurrentDepth,
+	})
+}
+
+// evalWorkers sets the number of active eval workers
+// GET: returns current count
+// POST: sets count from ?workers=N query param or JSON body {"workers": N}
+func (h *Handler) evalWorkers(w http.ResponseWriter, r *http.Request) {
+	if h.evalPool == nil {
+		http.Error(w, "eval pool not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		status := h.evalPool.GetStatus()
+		writeJSON(w, map[string]any{
+			"active_workers": status.ActiveWorkers,
+			"max_workers":    status.MaxWorkers,
+		})
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse worker count from query param or JSON body
+	var workers int
+	if wParam := r.URL.Query().Get("workers"); wParam != "" {
+		if n, err := json.Number(wParam).Int64(); err == nil {
+			workers = int(n)
+		} else {
+			http.Error(w, "invalid workers param", http.StatusBadRequest)
+			return
+		}
+	} else {
+		var body struct {
+			Workers int `json:"workers"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		workers = body.Workers
+	}
+
+	newCount := h.evalPool.SetActiveWorkers(workers)
+	h.log.Info().Int("workers", newCount).Msg("eval workers updated via API")
+
+	writeJSON(w, map[string]any{
+		"active_workers": newCount,
+		"max_workers":    h.evalPool.GetStatus().MaxWorkers,
+	})
 }
 
 // writeJSON writes a JSON response
