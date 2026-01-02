@@ -158,15 +158,31 @@ func main() {
 	// Parse dirty memory limit
 	dirtyMemLimit := parseSize(*dirtyLimit)
 
+	// Create refutation scanner first (so we can pass it to ingest for pausing)
+	var scanner *eval.RefutationScanner
+	if *refuteWorker && evalPool != nil {
+		scanner = eval.NewRefutationScanner(eval.RefutationScannerConfig{
+			Logger:        logger.With().Str("component", "refutation-scanner").Logger(),
+			BadThreshold:  int16(*badThreshold),
+			GoodThreshold: int16(*goodThreshold),
+			BatchSize:     50,
+		}, ps, evalPool)
+	}
+
 	// Start ingest worker if configured
 	if *ingestDir != "" {
-		worker, err := ingest.NewWorker(ingest.Config{
+		cfg := ingest.Config{
 			WatchDir:      *ingestDir,
 			RatingMin:     *ingestRating,
 			FlushEvery:    1000,
 			DirtyMemLimit: dirtyMemLimit,
 			Logger:        logger.With().Str("component", "ingest").Logger(),
-		}, ps)
+		}
+		// Pause scanner during ingest to reduce contention
+		if scanner != nil {
+			cfg.PauseDuring = []ingest.Pausable{scanner}
+		}
+		worker, err := ingest.NewWorker(cfg, ps)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("create ingest worker")
 		}
@@ -198,14 +214,7 @@ func main() {
 	}
 
 	// Start refutation scanner (shares workers with eval pool)
-	if *refuteWorker && evalPool != nil {
-		scanner := eval.NewRefutationScanner(eval.RefutationScannerConfig{
-			Logger:        logger.With().Str("component", "refutation-scanner").Logger(),
-			BadThreshold:  int16(*badThreshold),
-			GoodThreshold: int16(*goodThreshold),
-			BatchSize:     50,
-		}, ps, evalPool)
-
+	if scanner != nil {
 		go func() {
 			if err := scanner.Run(ctx); err != nil && err != context.Canceled {
 				logger.Error().Err(err).Msg("refutation scanner stopped")
