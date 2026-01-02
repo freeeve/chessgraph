@@ -61,7 +61,7 @@ const (
 	PSMetaFileName = "posstore.meta"
 
 	// PSMaxCachedBlocks is the default number of decompressed block files to cache
-	PSMaxCachedBlocks = 256
+	PSMaxCachedBlocks = 1024
 
 	// Block file format constants
 	PSBlockMagic      = "CGPK"   // ChessGraph Position Block
@@ -710,6 +710,65 @@ func (ps *PositionStore) Put(pos graph.PositionKey, record *PositionRecord) erro
 
 	// Store/update the record
 	keyMap[blockKey] = *record
+	ps.totalWrites++
+
+	return nil
+}
+
+// Increment adds to position counts without reading from disk.
+// This is much faster for ingest as it avoids disk I/O.
+// The counts are merged with existing data at flush time.
+// wins/draws/losses are incremented (clamped at 65535)
+func (ps *PositionStore) Increment(pos graph.PositionKey, wins, draws, losses uint16) error {
+	if ps.readOnly {
+		return ErrPSReadOnly
+	}
+
+	prefix := ExtractPrefix(pos)
+	blockKey := ExtractBlockKey(pos)
+	filename := prefix.BlockFileName()
+
+	ps.dirtyMu.Lock()
+	defer ps.dirtyMu.Unlock()
+
+	// Get or create the inner map for this filename
+	keyMap := ps.dirtyBlocks[filename]
+	if keyMap == nil {
+		keyMap = make(map[BlockKey]PositionRecord)
+		ps.dirtyBlocks[filename] = keyMap
+		ps.dirtyBytes += int64(len(filename)) + 50 // map entry overhead
+	}
+
+	// Get existing record or create new one
+	rec, exists := keyMap[blockKey]
+	if !exists {
+		ps.dirtyBytes += BlockRecordSize
+	}
+
+	// Increment counts with clamping
+	if wins > 0 {
+		if rec.Wins+wins < rec.Wins { // overflow
+			rec.Wins = 65535
+		} else {
+			rec.Wins += wins
+		}
+	}
+	if draws > 0 {
+		if rec.Draws+draws < rec.Draws {
+			rec.Draws = 65535
+		} else {
+			rec.Draws += draws
+		}
+	}
+	if losses > 0 {
+		if rec.Losses+losses < rec.Losses {
+			rec.Losses = 65535
+		} else {
+			rec.Losses += losses
+		}
+	}
+
+	keyMap[blockKey] = rec
 	ps.totalWrites++
 
 	return nil
@@ -1585,8 +1644,35 @@ func mergeBlockRecords(existing, newer []BlockRecord) []BlockRecord {
 			result = append(result, newer[j])
 			j++
 		} else {
-			// Same key: newer overwrites
-			result = append(result, newer[j])
+			// Same key: merge by adding counts and keeping best eval data
+			merged := existing[i].Data
+			// Add counts with overflow protection (accumulative merge for ingest)
+			newWins := uint32(merged.Wins) + uint32(newer[j].Data.Wins)
+			if newWins > 65535 {
+				merged.Wins = 65535
+			} else {
+				merged.Wins = uint16(newWins)
+			}
+			newDraws := uint32(merged.Draws) + uint32(newer[j].Data.Draws)
+			if newDraws > 65535 {
+				merged.Draws = 65535
+			} else {
+				merged.Draws = uint16(newDraws)
+			}
+			newLosses := uint32(merged.Losses) + uint32(newer[j].Data.Losses)
+			if newLosses > 65535 {
+				merged.Losses = 65535
+			} else {
+				merged.Losses = uint16(newLosses)
+			}
+			// Keep evaluation data from newer if it has any, otherwise keep existing
+			if newer[j].Data.CP != 0 || newer[j].Data.DTM != DTMUnknown || newer[j].Data.DTZ != 0 {
+				merged.CP = newer[j].Data.CP
+				merged.DTM = newer[j].Data.DTM
+				merged.DTZ = newer[j].Data.DTZ
+				merged.ProvenDepth = newer[j].Data.ProvenDepth
+			}
+			result = append(result, BlockRecord{Key: existing[i].Key, Data: merged})
 			i++
 			j++
 		}

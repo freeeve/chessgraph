@@ -267,13 +267,13 @@ func TestPositionStoreBuilderUpdate(t *testing.T) {
 	builder.UpdatePosition(startPos, record2)
 	builder.Flush()
 
-	// Verify updated
+	// Verify merged (additive): 10 + 20 = 30
 	found, err := builder.LookupPosition(startPos)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if found.Wins != 20 {
-		t.Errorf("Wins after update: got %d, want 20", found.Wins)
+	if found.Wins != 30 {
+		t.Errorf("Wins after update: got %d, want 30 (10+20)", found.Wins)
 	}
 }
 

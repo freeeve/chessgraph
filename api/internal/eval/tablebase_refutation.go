@@ -31,6 +31,9 @@ type RefutationScanner struct {
 	positionsScanned int64
 	extremeFound     int64
 	currentDepth     int32
+
+	// Pause control
+	paused int32 // atomic: 1 = paused, 0 = running
 }
 
 // NewRefutationScanner creates a new refutation scanner.
@@ -58,6 +61,25 @@ func (s *RefutationScanner) Stats() (scanned, extreme int64, currentDepth int32)
 	return atomic.LoadInt64(&s.positionsScanned),
 		atomic.LoadInt64(&s.extremeFound),
 		atomic.LoadInt32(&s.currentDepth)
+}
+
+// Pause pauses the scanner. Safe to call multiple times.
+func (s *RefutationScanner) Pause() {
+	if atomic.CompareAndSwapInt32(&s.paused, 0, 1) {
+		s.log.Info().Msg("refutation scanner paused")
+	}
+}
+
+// Resume resumes the scanner. Safe to call multiple times.
+func (s *RefutationScanner) Resume() {
+	if atomic.CompareAndSwapInt32(&s.paused, 1, 0) {
+		s.log.Info().Msg("refutation scanner resumed")
+	}
+}
+
+// IsPaused returns true if the scanner is paused.
+func (s *RefutationScanner) IsPaused() bool {
+	return atomic.LoadInt32(&s.paused) == 1
 }
 
 // Run starts the refutation scanner.
@@ -122,6 +144,16 @@ func (s *RefutationScanner) scanDepthLevel(ctx context.Context, targetDepth int)
 		case <-ctx.Done():
 			return false
 		default:
+		}
+
+		// Wait while paused (e.g., during ingest)
+		for s.IsPaused() {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(500 * time.Millisecond):
+				// Check again
+			}
 		}
 
 		// Only process positions at exactly the target depth

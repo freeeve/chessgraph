@@ -309,13 +309,13 @@ func TestPositionStoreMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Should have merged value
+	// Should have merged (additive) value: 100 + 200 = 300
 	found, err := ps.Get(pos)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if found.Wins != 200 {
-		t.Errorf("After merge: got Wins=%d, want 200", found.Wins)
+	if found.Wins != 300 {
+		t.Errorf("After merge: got Wins=%d, want 300 (100+200)", found.Wins)
 	}
 }
 

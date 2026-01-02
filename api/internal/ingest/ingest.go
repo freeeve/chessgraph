@@ -14,6 +14,12 @@ import (
 	"github.com/freeeve/chessgraph/api/internal/store"
 )
 
+// Pausable is an interface for components that can be paused during ingest.
+type Pausable interface {
+	Pause()
+	Resume()
+}
+
 // Config configures the ingest worker.
 type Config struct {
 	WatchDir      string         // Directory to watch for PGN files
@@ -23,6 +29,7 @@ type Config struct {
 	DirtyMemLimit int64          // Memory limit for dirty blocks (bytes), 0 = use count-based
 	PollInterval  time.Duration  // How often to check for new files
 	Logger        zerolog.Logger // Logger
+	PauseDuring   []Pausable     // Components to pause during ingest
 }
 
 // Worker watches a folder and ingests PGN files.
@@ -116,6 +123,16 @@ func (w *Worker) processNewFiles(ctx context.Context) error {
 
 	w.log.Info().Int("count", len(files)).Msg("found PGN files to process")
 
+	// Pause other components during ingest to reduce contention
+	for _, p := range w.cfg.PauseDuring {
+		p.Pause()
+	}
+	defer func() {
+		for _, p := range w.cfg.PauseDuring {
+			p.Resume()
+		}
+	}()
+
 	for _, name := range files {
 		select {
 		case <-ctx.Done():
@@ -195,33 +212,31 @@ gameLoop:
 		for _, mv := range game.Moves {
 			posKey := pos.Pack()
 
-			rec, err := w.ps.Get(posKey)
-			if err != nil || rec == nil {
-				rec = &store.PositionRecord{}
-			}
-
-			// Increment counts from side-to-move perspective
+			// Determine increments from side-to-move perspective
+			// Use Increment() to avoid disk reads - merges at flush time
 			whiteToMove := depth%2 == 0
+			var wins, draws, losses uint16
 			if whiteToMove {
-				if isWin && rec.Wins < 65535 {
-					rec.Wins++
-				} else if isDraw && rec.Draws < 65535 {
-					rec.Draws++
-				} else if isLoss && rec.Losses < 65535 {
-					rec.Losses++
+				if isWin {
+					wins = 1
+				} else if isDraw {
+					draws = 1
+				} else if isLoss {
+					losses = 1
 				}
 			} else {
-				if isLoss && rec.Wins < 65535 {
-					rec.Wins++
-				} else if isDraw && rec.Draws < 65535 {
-					rec.Draws++
-				} else if isWin && rec.Losses < 65535 {
-					rec.Losses++
+				// Flip perspective for black
+				if isLoss {
+					wins = 1
+				} else if isDraw {
+					draws = 1
+				} else if isWin {
+					losses = 1
 				}
 			}
 
-			if err := w.ps.Put(posKey, rec); err != nil {
-				w.log.Warn().Err(err).Msg("put position failed")
+			if err := w.ps.Increment(posKey, wins, draws, losses); err != nil {
+				w.log.Warn().Err(err).Msg("increment position failed")
 				break
 			}
 			positionsUpdated++
