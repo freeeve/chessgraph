@@ -3,26 +3,37 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/pprof"
 	"strings"
 	"time"
 
 	"github.com/freeeve/pgn/v2"
 	"github.com/rs/zerolog"
 
+	"github.com/freeeve/chessgraph/api/internal/eval"
 	"github.com/freeeve/chessgraph/api/internal/store"
 )
 
 // Handler uses the position store.
 type Handler struct {
-	ps  *store.PositionStore
-	log zerolog.Logger
+	ps       *store.PositionStore
+	evalPool *eval.TablebasePool
+	log      zerolog.Logger
 }
 
 // NewRouter creates a new HTTP router using the position store.
-func NewRouter(log zerolog.Logger, ps *store.PositionStore) http.Handler {
+// evalPool is optional - if provided, browsed positions will be queued for evaluation.
+func NewRouter(log zerolog.Logger, ps *store.PositionStore, evalPool *eval.TablebasePool) http.Handler {
 	h := &Handler{
-		ps:  ps,
-		log: log,
+		ps:       ps,
+		evalPool: evalPool,
+		log:      log,
+	}
+
+	if evalPool != nil {
+		log.Info().Msg("browse eval enabled - positions without evals will be queued")
+	} else {
+		log.Info().Msg("browse eval disabled - run with -eval=true to enable")
 	}
 
 	mux := http.NewServeMux()
@@ -33,6 +44,13 @@ func NewRouter(log zerolog.Logger, ps *store.PositionStore) http.Handler {
 	mux.Handle("/v1/tree/", http.HandlerFunc(h.tree))
 	mux.Handle("/v1/fen", http.HandlerFunc(h.fenLookup))
 	mux.Handle("/v1/stats", http.HandlerFunc(h.stats))
+
+	// pprof endpoints
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 	handler := CORS(RequestID(AccessLog(log, mux)))
 	return handler
@@ -213,6 +231,7 @@ type TreeNode struct {
 	CP          int16       `json:"cp,omitempty"`           // Centipawn evaluation
 	DTM         int16       `json:"dtm,omitempty"`          // Distance to mate (+ = win, - = loss)
 	ProvenDepth uint16      `json:"proven_depth,omitempty"` // Depth at which eval was proven
+	HasEval     bool        `json:"has_eval"`               // Whether position has been evaluated
 	Children    []*TreeNode `json:"children,omitempty"`     // Child nodes (next moves)
 }
 
@@ -321,6 +340,16 @@ func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, u
 				node.DTM = int16(-dist)
 			}
 		}
+
+		// If position has no eval (CP unknown and no DTM), queue it for evaluation
+		hasEval := rec.HasCP() || rec.DTM != store.DTMUnknown
+		node.HasEval = hasEval
+		if !hasEval && h.evalPool != nil {
+			added := h.evalPool.EnqueueBrowse(posKey)
+			if added {
+				h.log.Debug().Str("fen", node.FEN).Uint32("count", node.Count).Msg("queued position for browse eval")
+			}
+		}
 	}
 
 	// If we need children, generate them
@@ -361,7 +390,12 @@ func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, u
 			if childRec, err := h.ps.Get(childKey); err == nil && childRec != nil {
 				count = uint32(childRec.Wins) + uint32(childRec.Draws) + uint32(childRec.Losses)
 				cp = childRec.CP
-				hasEval = childRec.ProvenDepth > 0
+				hasEval = childRec.HasCP() || childRec.DTM != store.DTMUnknown
+
+				// Queue all browsed child positions for eval if they don't have one
+				if !hasEval && h.evalPool != nil {
+					h.evalPool.EnqueueBrowse(childKey)
+				}
 			}
 
 			candidates = append(candidates, moveCandidate{

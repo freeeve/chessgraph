@@ -16,12 +16,13 @@ import (
 
 // Config configures the ingest worker.
 type Config struct {
-	WatchDir     string         // Directory to watch for PGN files
-	ProcessedDir string         // Directory to move processed files to
-	RatingMin    int            // Minimum rating filter
-	FlushEvery   int            // Flush after N games
-	PollInterval time.Duration  // How often to check for new files
-	Logger       zerolog.Logger // Logger
+	WatchDir      string         // Directory to watch for PGN files
+	ProcessedDir  string         // Directory to move processed files to
+	RatingMin     int            // Minimum rating filter
+	FlushEvery    int            // Flush after N games
+	DirtyMemLimit int64          // Memory limit for dirty blocks (bytes), 0 = use count-based
+	PollInterval  time.Duration  // How often to check for new files
+	Logger        zerolog.Logger // Logger
 }
 
 // Worker watches a folder and ingests PGN files.
@@ -236,9 +237,13 @@ gameLoop:
 		// Increment global game counter
 		w.ps.IncrementGameCount(1)
 
-		// Periodic flush
+		// Periodic flush (async to allow ingestion to continue)
 		if gamesProcessed > 0 && gamesProcessed%int64(w.cfg.FlushEvery) == 0 {
-			w.ps.FlushIfNeeded(256)
+			if w.cfg.DirtyMemLimit > 0 {
+				w.ps.FlushIfMemoryNeededAsync(w.cfg.DirtyMemLimit)
+			} else {
+				w.ps.FlushIfNeededAsync(256)
+			}
 		}
 
 		// Periodic logging

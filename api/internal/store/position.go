@@ -22,6 +22,12 @@ type PositionRecord struct {
 const positionRecordSize = 14
 
 const (
+	// ProvenDepth flag bits
+	// Bit 15 (0x8000): HasCP flag - set when position has been evaluated
+	// Bits 0-14: actual proven depth value (0-32767)
+	ProvenDepthHasCPFlag uint16 = 0x8000
+	ProvenDepthMask      uint16 = 0x7FFF // Mask for actual depth value
+
 	DTMUnknown       int16 = 0
 	DTMDrawBase      int16 = -32768
 	DTMDrawThreshold int16 = -16385
@@ -237,4 +243,29 @@ func saturatingAddSigned16(a uint16, delta int32) uint16 {
 
 func (r *PositionRecord) Count() uint32 {
 	return uint32(r.Wins) + uint32(r.Draws) + uint32(r.Losses)
+}
+
+// HasCP returns true if the record has a valid CP evaluation.
+// Uses the high bit of ProvenDepth as the "evaluated" flag.
+func (r *PositionRecord) HasCP() bool {
+	return r.ProvenDepth&ProvenDepthHasCPFlag != 0
+}
+
+// SetHasCP sets the HasCP flag in ProvenDepth.
+func (r *PositionRecord) SetHasCP(hasCP bool) {
+	if hasCP {
+		r.ProvenDepth |= ProvenDepthHasCPFlag
+	} else {
+		r.ProvenDepth &= ProvenDepthMask
+	}
+}
+
+// GetProvenDepth returns the actual proven depth value (without flag bits).
+func (r *PositionRecord) GetProvenDepth() uint16 {
+	return r.ProvenDepth & ProvenDepthMask
+}
+
+// SetProvenDepth sets the proven depth value while preserving flag bits.
+func (r *PositionRecord) SetProvenDepth(depth uint16) {
+	r.ProvenDepth = (r.ProvenDepth & ProvenDepthHasCPFlag) | (depth & ProvenDepthMask)
 }

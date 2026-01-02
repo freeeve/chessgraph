@@ -3,6 +3,7 @@ package eval
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,14 +18,24 @@ import (
 
 // TablebasePoolConfig configures the tablebase evaluation pool.
 type TablebasePoolConfig struct {
-	StockfishPath string
-	Logger        zerolog.Logger
-	Depth         int // Stockfish search depth
-	HashMB        int // Stockfish hash table size per worker
-	Threads       int // Stockfish threads per worker
-	NumWorkers    int // Number of parallel Stockfish workers
-	QueueSize     int // Size of the work queue
-	MaxDepth      int // Maximum tree depth to explore
+	StockfishPath   string
+	Logger          zerolog.Logger
+	Depth           int  // Stockfish search depth for eval
+	RefutationDepth int  // Stockfish search depth for refutation (0 = Depth + 10)
+	HashMB          int  // Stockfish hash table size per worker
+	Threads         int  // Stockfish threads per worker
+	Nice            int  // Nice value for Stockfish processes (0 = disabled)
+	NumWorkers      int  // Number of parallel Stockfish workers
+	QueueSize       int  // Size of the work queue
+	MaxDepth        int  // Maximum tree depth to explore
+	RefutationOnly  bool // If true, skip DFS enumeration (only process browse/refutation queues)
+}
+
+// RefutationJob represents a position to prove with refutation analysis.
+type RefutationJob struct {
+	Position pgn.PackedPosition
+	CP       int16 // Current CP evaluation
+	Winning  bool  // True if we're winning and want to prove mate delivery
 }
 
 // TablebasePool manages a pool of Stockfish workers with a shared work queue.
@@ -33,13 +44,21 @@ type TablebasePool struct {
 	log zerolog.Logger
 	ps  *store.PositionStore
 
-	workQueue chan pgn.PackedPosition
-	wg        sync.WaitGroup
+	workQueue       chan pgn.PackedPosition
+	browseQueue     *BrowseQueue // Priority queue for user-browsed positions
+	refutationQueue chan RefutationJob
+	wg              sync.WaitGroup
+
+	// Refutation config
+	refutationDepth int // Search depth for refutation (deeper than normal eval)
 
 	// Stats
-	expanded     int64
-	evaluated    int64
-	currentDepth int32
+	expanded        int64
+	evaluated       int64
+	browseEvaled    int64 // Positions evaluated from browse queue
+	refutationEvaled int64 // Positions evaluated from refutation queue
+	matesProved     int64 // Mates proved by refutation
+	currentDepth    int32
 }
 
 // NewTablebasePool creates a new tablebase evaluation pool.
@@ -66,22 +85,62 @@ func NewTablebasePool(cfg TablebasePoolConfig, ps *store.PositionStore) (*Tableb
 		cfg.MaxDepth = 20
 	}
 
+	refuteDepth := cfg.RefutationDepth
+	if refuteDepth == 0 {
+		refuteDepth = cfg.Depth // Default: same as eval depth
+	}
+
 	return &TablebasePool{
-		cfg:       cfg,
-		log:       cfg.Logger,
-		ps:        ps,
-		workQueue: make(chan pgn.PackedPosition, cfg.QueueSize),
+		cfg:             cfg,
+		log:             cfg.Logger,
+		ps:              ps,
+		workQueue:       make(chan pgn.PackedPosition, cfg.QueueSize),
+		browseQueue:     NewBrowseQueue(10000), // Priority queue for user-browsed positions
+		refutationQueue: make(chan RefutationJob, 1000),
+		refutationDepth: refuteDepth,
 	}, nil
+}
+
+// BrowseQueue returns the browse queue for external enqueuing.
+func (p *TablebasePool) BrowseQueue() *BrowseQueue {
+	return p.browseQueue
+}
+
+// EnqueueBrowse adds a position to the browse queue for priority evaluation.
+// Returns true if the position was added (not a duplicate).
+func (p *TablebasePool) EnqueueBrowse(pos pgn.PackedPosition) bool {
+	return p.browseQueue.Enqueue(pos)
+}
+
+// EnqueueRefutation adds a position to the refutation queue for mate proving.
+// Non-blocking: drops the job if queue is full.
+func (p *TablebasePool) EnqueueRefutation(job RefutationJob) bool {
+	select {
+	case p.refutationQueue <- job:
+		return true
+	default:
+		return false
+	}
+}
+
+// RefutationQueueLen returns the current length of the refutation queue.
+func (p *TablebasePool) RefutationQueueLen() int {
+	return len(p.refutationQueue)
 }
 
 // Run starts the pool with one enumerator and N workers.
 func (p *TablebasePool) Run(ctx context.Context) error {
+	mode := "full"
+	if p.cfg.RefutationOnly {
+		mode = "refutation-only"
+	}
 	p.log.Info().
 		Str("stockfish", p.cfg.StockfishPath).
 		Int("eval_depth", p.cfg.Depth).
 		Int("max_depth", p.cfg.MaxDepth).
 		Int("num_workers", p.cfg.NumWorkers).
 		Int("queue_size", p.cfg.QueueSize).
+		Str("mode", mode).
 		Msg("tablebase pool started")
 
 	// Start worker goroutines
@@ -94,8 +153,15 @@ func (p *TablebasePool) Run(ctx context.Context) error {
 		}()
 	}
 
-	// Run enumerator in main goroutine
-	p.runEnumerator(ctx)
+	if p.cfg.RefutationOnly {
+		// In refutation-only mode, just wait for context cancellation
+		// Workers will process browse and refutation queues only
+		<-ctx.Done()
+		close(p.workQueue)
+	} else {
+		// Run enumerator in main goroutine
+		p.runEnumerator(ctx)
+	}
 
 	// Wait for workers to finish
 	p.wg.Wait()
@@ -229,7 +295,9 @@ func (p *TablebasePool) enumerateForEval(ctx context.Context, targetDepth int) i
 		pos := pgn.NewStartingPosition()
 		packed := pos.Pack()
 		record, err := p.ps.Get(packed)
-		if err == nil && record != nil && record.ProvenDepth == 0 {
+		// Need eval if CP is unknown AND no DTM
+		needsEval := err == nil && record != nil && !record.HasCP() && record.DTM == store.DTMUnknown
+		if needsEval {
 			select {
 			case p.workQueue <- packed:
 				queued++
@@ -258,7 +326,8 @@ func (p *TablebasePool) enumerateForEval(ctx context.Context, targetDepth int) i
 			return true
 		}
 
-		if record.ProvenDepth == 0 {
+		// Need eval if CP is unknown AND no DTM
+		if !record.HasCP() && record.DTM == store.DTMUnknown {
 			select {
 			case p.workQueue <- packed:
 				queued++
@@ -318,9 +387,64 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 		return
 	}
 
-	log.Info().Msg("worker started")
+	// Set nice value for lower CPU priority if configured (after options so engine is initialized)
+	if p.cfg.Nice > 0 {
+		nice := p.cfg.Nice
+		if nice > 19 {
+			log.Warn().Int("requested", nice).Int("clamped", 19).Msg("nice value clamped to max 19")
+			nice = 19
+		}
+		if err := engine.SetNice(nice); err != nil {
+			log.Warn().Err(err).Int("nice", nice).Msg("failed to set nice value")
+		} else {
+			log.Info().Int("nice", nice).Msg("set engine nice value")
+		}
+	}
+
+	log.Info().Int("threads", p.cfg.Threads).Int("hash_mb", p.cfg.HashMB).Msg("worker started")
 
 	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("worker stopping (context cancelled)")
+			return
+		default:
+		}
+
+		// Check browse queue first (highest priority)
+		if browsePos, ok := p.browseQueue.Dequeue(); ok {
+			log.Debug().Str("position", browsePos.String()).Msg("processing browse queue position")
+			if err := p.evaluatePosition(ctx, engine, browsePos, log); err != nil {
+				log.Warn().Err(err).Msg("browse eval failed")
+			} else {
+				atomic.AddInt64(&p.browseEvaled, 1)
+				log.Info().
+					Str("position", browsePos.String()).
+					Int64("total_browse_evaled", atomic.LoadInt64(&p.browseEvaled)).
+					Int("queue_remaining", p.browseQueue.Len()).
+					Msg("browse eval complete")
+			}
+			continue
+		}
+
+		// Check refutation queue second (higher priority than DFS)
+		select {
+		case job := <-p.refutationQueue:
+			log.Debug().Int16("cp", job.CP).Bool("winning", job.Winning).Msg("processing refutation job")
+			proved, err := p.proveRefutation(ctx, engine, job, log)
+			if err != nil {
+				log.Warn().Err(err).Msg("refutation failed")
+			} else {
+				atomic.AddInt64(&p.refutationEvaled, 1)
+				if proved {
+					atomic.AddInt64(&p.matesProved, 1)
+				}
+			}
+			continue
+		default:
+		}
+
+		// Fall back to DFS work queue
 		select {
 		case <-ctx.Done():
 			log.Info().Msg("worker stopping (context cancelled)")
@@ -333,6 +457,9 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 			if err := p.evaluatePosition(ctx, engine, packed, log); err != nil {
 				log.Warn().Err(err).Msg("eval failed")
 			}
+		default:
+			// No work available, wait a bit
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
@@ -344,7 +471,8 @@ func (p *TablebasePool) evaluatePosition(ctx context.Context, engine *uci.Engine
 	if err != nil || record == nil {
 		record = &store.PositionRecord{}
 	}
-	if record.ProvenDepth > 0 {
+	// Already evaluated if we have a CP eval or a DTM
+	if record.HasCP() || record.DTM != store.DTMUnknown {
 		return nil // Already evaluated
 	}
 
@@ -387,11 +515,13 @@ func (p *TablebasePool) evaluatePosition(ctx context.Context, engine *uci.Engine
 	if best.Mate {
 		mate = int16(score)
 		record.DTM = store.EncodeMate(score)
+		// CP not set for mate positions (HasCP remains false)
 	} else {
 		cp = int16(score)
+		record.CP = cp
+		record.SetHasCP(true)
 	}
-	record.ProvenDepth = uint16(p.cfg.Depth)
-	record.CP = cp
+	record.SetProvenDepth(uint16(p.cfg.Depth))
 
 	if err := p.ps.Put(packed, record); err != nil {
 		return fmt.Errorf("put position: %w", err)
@@ -408,9 +538,329 @@ func (p *TablebasePool) evaluatePosition(ctx context.Context, engine *uci.Engine
 	return nil
 }
 
+// proveRefutation attempts to prove a forced mate using DFS along best/worst lines.
+// For winning positions: follow our best moves to prove we can deliver mate
+// For losing positions: check all our moves to prove opponent can always win
+func (p *TablebasePool) proveRefutation(ctx context.Context, engine *uci.Engine, job RefutationJob, log zerolog.Logger) (bool, error) {
+	packed := job.Position
+	pos := packed.Unpack()
+	if pos == nil {
+		return false, fmt.Errorf("failed to unpack position")
+	}
+
+	fen := pos.ToFEN()
+	log.Debug().Str("fen", fen).Int16("cp", job.CP).Bool("winning", job.Winning).Msg("starting DFS proof")
+
+	result := p.provePositionDFS(ctx, engine, packed, 0, 50, log) // max depth 50 plies
+
+	if result.yielded {
+		// Re-enqueue - browse queue had higher priority work
+		p.EnqueueRefutation(job)
+		log.Debug().Str("fen", fen).Msg("refutation yielded for browse priority")
+		return false, nil
+	}
+
+	if result.proved {
+		log.Info().
+			Str("fen", fen).
+			Int16("dtm", result.dtm).
+			Uint16("proven_depth", result.provenDepth).
+			Bool("draw", result.isDraw).
+			Msg("proof complete")
+	}
+	return result.proved, nil
+}
+
+// proofResult holds the result of a DFS proof attempt
+type proofResult struct {
+	proved      bool
+	yielded     bool   // true if we yielded for higher priority work
+	dtm         int16  // positive = we win in N, negative = we lose in N, 0 = draw/mated
+	provenDepth uint16 // how deep we searched to prove this
+	isDraw      bool   // true if forced draw
+}
+
+// provePositionDFS recursively proves a position via DFS.
+// Returns proof result with DTM, proven depth, and draw status.
+// Yields early if browse queue has work (higher priority).
+func (p *TablebasePool) provePositionDFS(ctx context.Context, engine *uci.Engine, packed pgn.PackedPosition, depth, maxDepth int, log zerolog.Logger) proofResult {
+	select {
+	case <-ctx.Done():
+		return proofResult{}
+	default:
+	}
+
+	// Yield if browse queue has higher priority work
+	if p.browseQueue.Len() > 0 {
+		return proofResult{yielded: true}
+	}
+
+	if depth > maxDepth {
+		return proofResult{}
+	}
+
+	pos := packed.Unpack()
+	if pos == nil {
+		return proofResult{}
+	}
+
+	// Get or create record
+	record, err := p.ps.Get(packed)
+	if err != nil || record == nil {
+		record = &store.PositionRecord{}
+	}
+
+	// Already proven?
+	if record.DTM != store.DTMUnknown {
+		kind, dist := store.DecodeMate(record.DTM)
+		switch kind {
+		case store.MateWin:
+			return proofResult{proved: true, dtm: dist, provenDepth: record.ProvenDepth}
+		case store.MateLoss:
+			return proofResult{proved: true, dtm: -dist, provenDepth: record.ProvenDepth}
+		case store.MateDraw:
+			return proofResult{proved: true, dtm: 0, provenDepth: record.ProvenDepth, isDraw: true}
+		}
+		return proofResult{}
+	}
+
+	// Generate legal moves
+	moves := pgn.GenerateLegalMoves(pos)
+	if len(moves) == 0 {
+		if pos.IsInCheck() {
+			// Checkmate - side to move is mated (loses)
+			record.DTM = store.EncodeMate(0)
+			record.SetProvenDepth(uint16(depth))
+			_ = p.ps.Put(packed, record)
+			return proofResult{proved: true, dtm: 0, provenDepth: uint16(depth)}
+		}
+		// Stalemate = draw
+		record.DTM = store.EncodeDraw(0)
+		record.SetProvenDepth(uint16(depth))
+		_ = p.ps.Put(packed, record)
+		return proofResult{proved: true, dtm: 0, provenDepth: uint16(depth), isDraw: true}
+	}
+
+	// Evaluate position if needed to get CP for move ordering
+	if !record.HasCP() {
+		if err := p.evaluatePosition(ctx, engine, packed, log); err != nil {
+			return proofResult{}
+		}
+		record, _ = p.ps.Get(packed)
+		if record == nil {
+			return proofResult{}
+		}
+	}
+
+	// Sort moves by child evaluation (best first for winning, worst first for losing)
+	type moveWithEval struct {
+		move pgn.Mv
+		cp   int16
+		dtm  int16
+	}
+	moveEvals := make([]moveWithEval, 0, len(moves))
+
+	for _, mv := range moves {
+		childPos := packed.Unpack()
+		if childPos == nil {
+			continue
+		}
+		if err := pgn.ApplyMove(childPos, mv); err != nil {
+			continue
+		}
+		childPacked := childPos.Pack()
+
+		childRec, err := p.ps.Get(childPacked)
+		if err != nil || childRec == nil {
+			// Evaluate child
+			if err := p.evaluatePosition(ctx, engine, childPacked, log); err != nil {
+				continue
+			}
+			childRec, _ = p.ps.Get(childPacked)
+			if childRec == nil {
+				continue
+			}
+		}
+
+		moveEvals = append(moveEvals, moveWithEval{
+			move: mv,
+			cp:   childRec.CP,
+			dtm:  childRec.DTM,
+		})
+	}
+
+	if len(moveEvals) == 0 {
+		return proofResult{}
+	}
+
+	// Sort: prioritize moves where child is losing (we win), then by CP
+	sort.Slice(moveEvals, func(i, j int) bool {
+		iKind, iDist := store.DecodeMate(moveEvals[i].dtm)
+		jKind, jDist := store.DecodeMate(moveEvals[j].dtm)
+
+		// MateLoss for child = we win (best)
+		if iKind == store.MateLoss && jKind != store.MateLoss {
+			return true
+		}
+		if jKind == store.MateLoss && iKind != store.MateLoss {
+			return false
+		}
+		if iKind == store.MateLoss && jKind == store.MateLoss {
+			return iDist < jDist // shorter win first
+		}
+
+		// Then by CP (lower = better for us since it's opponent's position)
+		return moveEvals[i].cp < moveEvals[j].cp
+	})
+
+	// DFS through moves
+	var bestWinDist int16 = 32767
+	var worstLossDist int16 = 0
+	var maxProvenDepth uint16 = 0
+	allMovesProven := true
+	allMovesLose := true
+	hasWinningMove := false
+	hasDrawingMove := false
+
+	for _, me := range moveEvals {
+		select {
+		case <-ctx.Done():
+			return proofResult{}
+		default:
+		}
+
+		childPos := packed.Unpack()
+		if childPos == nil {
+			continue
+		}
+		if err := pgn.ApplyMove(childPos, me.move); err != nil {
+			continue
+		}
+		childPacked := childPos.Pack()
+
+		// Check if child already has DTM
+		childRec, _ := p.ps.Get(childPacked)
+		if childRec != nil && childRec.DTM != store.DTMUnknown {
+			kind, dist := store.DecodeMate(childRec.DTM)
+			if childRec.ProvenDepth > maxProvenDepth {
+				maxProvenDepth = childRec.ProvenDepth
+			}
+			switch kind {
+			case store.MateLoss:
+				// Child loses = we win!
+				hasWinningMove = true
+				allMovesLose = false
+				winDist := dist + 1
+				if winDist < bestWinDist {
+					bestWinDist = winDist
+				}
+			case store.MateWin:
+				// Child wins = we lose with this move
+				lossDist := dist + 1
+				if lossDist > worstLossDist {
+					worstLossDist = lossDist
+				}
+			case store.MateDraw:
+				// Child is drawn = this move draws
+				hasDrawingMove = true
+				allMovesLose = false
+			default:
+				allMovesProven = false
+				allMovesLose = false
+			}
+			continue
+		}
+
+		// Recurse to prove child
+		result := p.provePositionDFS(ctx, engine, childPacked, depth+1, maxDepth, log)
+		if result.yielded {
+			return proofResult{yielded: true}
+		}
+		if !result.proved {
+			allMovesProven = false
+			allMovesLose = false
+			continue
+		}
+
+		if result.provenDepth > maxProvenDepth {
+			maxProvenDepth = result.provenDepth
+		}
+
+		if result.isDraw {
+			hasDrawingMove = true
+			allMovesLose = false
+		} else if result.dtm <= 0 {
+			// Child is losing (or mated) = we win!
+			hasWinningMove = true
+			allMovesLose = false
+			winDist := int16(1)
+			if result.dtm < 0 {
+				winDist = -result.dtm + 1
+			}
+			if winDist < bestWinDist {
+				bestWinDist = winDist
+			}
+		} else {
+			// Child is winning = we lose with this move
+			lossDist := result.dtm + 1
+			if lossDist > worstLossDist {
+				worstLossDist = lossDist
+			}
+		}
+	}
+
+	// Minimax: we pick our best option
+	provenDepth := maxProvenDepth + 1
+
+	if hasWinningMove {
+		// We have at least one winning move - take shortest win
+		record.DTM = store.EncodeMate(int(bestWinDist))
+		record.ProvenDepth = provenDepth
+		_ = p.ps.Put(packed, record)
+		return proofResult{proved: true, dtm: bestWinDist, provenDepth: provenDepth}
+	}
+
+	if hasDrawingMove {
+		// No winning move but we can draw
+		record.DTM = store.EncodeDraw(0)
+		record.ProvenDepth = provenDepth
+		_ = p.ps.Put(packed, record)
+		return proofResult{proved: true, dtm: 0, provenDepth: provenDepth, isDraw: true}
+	}
+
+	if allMovesProven && allMovesLose && worstLossDist > 0 {
+		// All moves lose - we're mated in worstLossDist
+		record.DTM = store.EncodeMate(-int(worstLossDist))
+		record.ProvenDepth = provenDepth
+		_ = p.ps.Put(packed, record)
+		return proofResult{proved: true, dtm: -worstLossDist, provenDepth: provenDepth}
+	}
+
+	return proofResult{}
+}
+
+// PoolStats holds comprehensive pool statistics.
+type PoolStats struct {
+	Expanded         int64
+	Evaluated        int64
+	BrowseEvaled     int64
+	RefutationEvaled int64
+	MatesProved      int64
+	CurrentDepth     int32
+	BrowseQueueLen   int
+	RefutationQueueLen int
+}
+
 // Stats returns current pool statistics.
-func (p *TablebasePool) Stats() (expanded, evaluated int64, currentDepth int32) {
-	return atomic.LoadInt64(&p.expanded),
-		atomic.LoadInt64(&p.evaluated),
-		atomic.LoadInt32(&p.currentDepth)
+func (p *TablebasePool) Stats() PoolStats {
+	return PoolStats{
+		Expanded:         atomic.LoadInt64(&p.expanded),
+		Evaluated:        atomic.LoadInt64(&p.evaluated),
+		BrowseEvaled:     atomic.LoadInt64(&p.browseEvaled),
+		RefutationEvaled: atomic.LoadInt64(&p.refutationEvaled),
+		MatesProved:      atomic.LoadInt64(&p.matesProved),
+		CurrentDepth:     atomic.LoadInt32(&p.currentDepth),
+		BrowseQueueLen:   p.browseQueue.Len(),
+		RefutationQueueLen: len(p.refutationQueue),
+	}
 }

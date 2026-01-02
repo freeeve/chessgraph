@@ -46,8 +46,8 @@ func TestExtractPrefix(t *testing.T) {
 	}
 
 	// No EP
-	if prefix.EPFile != 0xFF {
-		t.Errorf("EPFile: got %x, want FF", prefix.EPFile)
+	if prefix.EP != 0xFF {
+		t.Errorf("EP: got %x, want FF", prefix.EP)
 	}
 }
 
@@ -70,8 +70,8 @@ func TestExtractPrefixAfterE4(t *testing.T) {
 	}
 
 	// EP file: e = 4
-	if prefix.EPFile != 4 {
-		t.Errorf("EPFile: got %d, want 4", prefix.EPFile)
+	if prefix.EP != 4 {
+		t.Errorf("EP: got %d, want 4", prefix.EP)
 	}
 }
 
@@ -84,21 +84,16 @@ func TestExtractSuffix(t *testing.T) {
 	pos := gs.Pack()
 	suffix := store.ExtractSuffix(pos)
 
-	// Side to move: white = 0
-	if suffix[0] != 0 {
-		t.Errorf("SideToMove: got %d, want 0", suffix[0])
-	}
-
-	// Suffix should be 21 bytes
-	if len(suffix) != 21 {
-		t.Errorf("Suffix length: got %d, want 21", len(suffix))
+	// V7: Suffix is just pieces (20 bytes), STM is in prefix now
+	if len(suffix) != store.SuffixSize {
+		t.Errorf("Suffix length: got %d, want %d", len(suffix), store.SuffixSize)
 	}
 
 	// The suffix contains packed pieces (N, B, R, Q for both sides)
 	// In starting position: 2 WN, 2 WB, 2 WR, 1 WQ, 2 BN, 2 BB, 2 BR, 1 BQ = 14 pieces
 	// Just verify the suffix is non-zero (pieces are packed)
 	nonZeroBytes := 0
-	for i := 1; i < 21; i++ {
+	for i := 0; i < len(suffix); i++ {
 		if suffix[i] != 0 {
 			nonZeroBytes++
 		}
@@ -117,10 +112,16 @@ func TestExtractSuffixBlackToMove(t *testing.T) {
 
 	pos := gs.Pack()
 	suffix := store.ExtractSuffix(pos)
+	prefix := store.ExtractPrefix(pos)
 
-	// Side to move: black = 1
-	if suffix[0] != 1 {
-		t.Errorf("SideToMove: got %d, want 1", suffix[0])
+	// V7: STM is now in prefix, not suffix
+	if prefix.STM != 1 {
+		t.Errorf("STM in prefix: got %d, want 1 (black)", prefix.STM)
+	}
+
+	// Suffix is just pieces (20 bytes)
+	if len(suffix) != store.SuffixSize {
+		t.Errorf("Suffix length: got %d, want %d", len(suffix), store.SuffixSize)
 	}
 }
 

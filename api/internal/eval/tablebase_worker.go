@@ -272,10 +272,9 @@ func (w *TablebaseWorker) expandDepthLevel(ctx context.Context, targetDepth int)
 		packed := pos.Pack()
 		_, err := w.ps.Get(packed)
 		if err == store.ErrPSKeyNotFound {
-			// Create empty record for this position
+			// Create empty record for this position (HasCP flag false by default)
 			record := &store.PositionRecord{
-				// Leave W/D/L at 0, will be filled by ingest
-				// Leave CP/DTM at 0, will be filled by evaluation
+				// Leave all fields at 0, will be filled by ingest
 			}
 			if err := w.ps.Put(packed, record); err != nil {
 				w.log.Warn().Err(err).Msg("put position failed during expansion")
@@ -331,7 +330,9 @@ func (w *TablebaseWorker) evaluateDepthLevel(ctx context.Context, targetDepth in
 		pos := pgn.NewStartingPosition()
 		packed := pos.Pack()
 		record, err := w.ps.Get(packed)
-		if err == nil && record != nil && record.ProvenDepth == 0 {
+		// Needs eval if CP is unknown AND no DTM
+		needsEval := err == nil && record != nil && !record.HasCP() && record.DTM == store.DTMUnknown
+		if needsEval {
 			positionsToEval = append(positionsToEval, positionToEval{pos: pos})
 		}
 		processed = 1
@@ -371,8 +372,8 @@ func (w *TablebaseWorker) evaluateDepthLevel(ctx context.Context, targetDepth in
 				return true // Position doesn't exist, skip (should have been expanded)
 			}
 
-			// Needs eval if ProvenDepth is 0 (never evaluated)
-			if record.ProvenDepth == 0 {
+			// Needs eval if CP is unknown AND no DTM
+			if !record.HasCP() && record.DTM == store.DTMUnknown {
 				// Clone position since enumerator reuses it
 				posClone := packed.Unpack()
 				if posClone != nil {
@@ -434,8 +435,8 @@ func (w *TablebaseWorker) evaluateAndStore(ctx context.Context, pos *pgn.GameSta
 		record = &store.PositionRecord{}
 	}
 
-	// Skip if already evaluated
-	if record.ProvenDepth > 0 {
+	// Skip if already evaluated (has CP or DTM)
+	if record.HasCP() || record.DTM != store.DTMUnknown {
 		return nil
 	}
 
@@ -482,11 +483,13 @@ func (w *TablebaseWorker) evaluateAndStore(ctx context.Context, pos *pgn.GameSta
 	if best.Mate {
 		mate = int16(score)
 		record.DTM = store.EncodeMate(score)
+		// For mate positions, HasCP remains false
 	} else {
 		cp = int16(score)
+		record.CP = cp
+		record.SetHasCP(true)
 	}
-	record.ProvenDepth = uint16(w.cfg.Depth)
-	record.CP = cp
+	record.SetProvenDepth(uint16(w.cfg.Depth))
 
 	if err := w.ps.Put(packed, record); err != nil {
 		return fmt.Errorf("put position: %w", err)

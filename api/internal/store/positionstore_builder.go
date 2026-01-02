@@ -55,7 +55,7 @@ func (b *PositionStoreBuilder) BuildFromEnumeration(ctx context.Context, startPo
 		// Get the packed position key
 		packed := pos.Pack()
 
-		// Create initial empty record
+		// Create initial empty record (HasCP flag is false since ProvenDepth is 0)
 		record := PositionRecord{
 			Wins:        0,
 			Draws:       0,
@@ -68,7 +68,6 @@ func (b *PositionStoreBuilder) BuildFromEnumeration(ctx context.Context, startPo
 
 		// Store the position
 		if err := b.ps.Put(packed, &record); err != nil {
-			buildErr = err
 			return false
 		}
 
@@ -132,7 +131,7 @@ func (b *PositionStoreBuilder) BuildFromEnumerationParallel(ctx context.Context,
 		// Get the packed position key
 		packed := pos.Pack()
 
-		// Create initial empty record
+		// Create initial empty record (HasCP flag is false since ProvenDepth is 0)
 		record := PositionRecord{
 			Wins:        0,
 			Draws:       0,
