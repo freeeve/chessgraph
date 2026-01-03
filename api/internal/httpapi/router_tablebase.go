@@ -241,6 +241,17 @@ type TreeNode struct {
 	ProvenDepth uint16      `json:"proven_depth,omitempty"` // Depth at which eval was proven
 	HasEval     bool        `json:"has_eval"`               // Whether position has been evaluated
 	Children    []*TreeNode `json:"children,omitempty"`     // Child nodes (next moves)
+	Path        []*PathNode `json:"path,omitempty"`         // Path from start (only on root when moves param used)
+}
+
+// PathNode represents a position in the path from start to current position
+type PathNode struct {
+	Position string `json:"position"`          // Base64 position key
+	FEN      string `json:"fen"`               // FEN string
+	UCI      string `json:"uci"`               // UCI move that led here
+	SAN      string `json:"san"`               // SAN move that led here
+	ECO      string `json:"eco,omitempty"`     // ECO opening code
+	Opening  string `json:"opening,omitempty"` // Opening name
 }
 
 // TreeRequest specifies what to fetch
@@ -258,8 +269,58 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 	// Parse position key from URL or use starting position
 	var posKey pgn.PackedPosition
 	var pos *pgn.GameState
+	var pathNodes []*PathNode
 
-	if len(parts) >= 3 && parts[2] != "" && parts[2] != "start" {
+	// Check for moves parameter first (preferred method)
+	movesParam := r.URL.Query().Get("moves")
+	if movesParam != "" {
+		// Parse moves and build path
+		pos = pgn.NewStartingPosition()
+		moves := strings.Split(movesParam, ",")
+
+		for _, uci := range moves {
+			uci = strings.TrimSpace(uci)
+			if uci == "" {
+				continue
+			}
+
+			// Parse UCI move
+			mv, err := pgn.ParseUCI(uci)
+			if err != nil {
+				http.Error(w, "invalid UCI move: "+uci+": "+err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			// Get SAN before applying move
+			san := uciToSAN(pos, mv)
+
+			// Apply move
+			if err := pgn.ApplyMove(pos, mv); err != nil {
+				http.Error(w, "failed to apply move: "+uci+": "+err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			// Build path node
+			posKey = pos.Pack()
+			pathNode := &PathNode{
+				Position: posKey.String(),
+				FEN:      pos.ToFEN(),
+				UCI:      uci,
+				SAN:      san,
+			}
+
+			// Look up ECO
+			if h.ecoDB != nil {
+				if opening := h.ecoDB.Lookup(posKey); opening != nil {
+					pathNode.ECO = opening.ECO
+					pathNode.Opening = opening.Name
+				}
+			}
+
+			pathNodes = append(pathNodes, pathNode)
+		}
+		posKey = pos.Pack()
+	} else if len(parts) >= 3 && parts[2] != "" && parts[2] != "start" {
 		var err error
 		posKey, err = pgn.ParsePackedPosition(parts[2])
 		if err != nil {
@@ -276,11 +337,11 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 		pos = pgn.NewStartingPosition()
 		posKey = pos.Pack()
 	}
-	h.log.Info().Str("fen", pos.ToFEN()).Msg("parsed position")
+	h.log.Info().Str("fen", pos.ToFEN()).Int("path_len", len(pathNodes)).Msg("parsed position")
 
 	// Parse query params
 	depth := 2
-	topMoves := 4   // Moves per level in tree (for visualization)
+	topMoves := 4     // Moves per level in tree (for visualization)
 	fetchMoves := 218 // First-level moves to return (for sidebar list)
 	if d := r.URL.Query().Get("depth"); d != "" {
 		if _, err := json.Number(d).Int64(); err == nil {
@@ -308,6 +369,11 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 	// Build tree recursively - first level uses fetchMoves, deeper levels use topMoves
 	root := h.buildTreeNode(pos, posKey, "", "", depth, topMoves, fetchMoves, true)
 
+	// Include path if we parsed moves
+	if len(pathNodes) > 0 {
+		root.Path = pathNodes
+	}
+
 	h.log.Info().
 		Dur("elapsed", time.Since(start)).
 		Int("depth", depth).
@@ -316,6 +382,103 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 		Msg("tree request completed")
 
 	writeJSON(w, root)
+}
+
+// uciToSAN converts a UCI move to SAN notation given the current position
+func uciToSAN(pos *pgn.GameState, mv pgn.Mv) string {
+	// Check for castling
+	if mv.Flags == 4 {
+		if mv.To > mv.From {
+			return "O-O"
+		}
+		return "O-O-O"
+	}
+
+	fromSq := int(mv.From)
+	toSq := int(mv.To)
+	fromFile := fromSq % 8
+	toFile := toSq % 8
+	toRank := toSq / 8
+
+	files := "abcdefgh"
+	ranks := "12345678"
+
+	piece := pos.PieceAt(mv.From)
+	isPawn := piece == 'P' || piece == 'p'
+	isCapture := pos.PieceAt(mv.To) != 0 || (isPawn && mv.Flags == 2)
+
+	var san string
+
+	if isPawn {
+		if isCapture {
+			san = string(files[fromFile]) + "x" + string(files[toFile]) + string(ranks[toRank])
+		} else {
+			san = string(files[toFile]) + string(ranks[toRank])
+		}
+		switch mv.Promo {
+		case pgn.PromoQueen:
+			san += "=Q"
+		case pgn.PromoRook:
+			san += "=R"
+		case pgn.PromoBishop:
+			san += "=B"
+		case pgn.PromoKnight:
+			san += "=N"
+		}
+	} else {
+		pieceChar := piece
+		if piece >= 'a' && piece <= 'z' {
+			pieceChar = piece - 32
+		}
+		san = string(pieceChar)
+
+		// Check for disambiguation
+		disambig := ""
+		moves := pgn.GenerateLegalMoves(pos)
+		for _, other := range moves {
+			if other.To == mv.To && other.From != mv.From {
+				otherPiece := pos.PieceAt(other.From)
+				otherUpper := otherPiece
+				if otherPiece >= 'a' && otherPiece <= 'z' {
+					otherUpper = otherPiece - 32
+				}
+				if otherUpper == pieceChar {
+					otherFromFile := int(other.From) % 8
+					otherFromRank := int(other.From) / 8
+					if fromFile != otherFromFile {
+						disambig = string(files[fromFile])
+					} else if fromSq/8 != otherFromRank {
+						disambig = string(ranks[fromSq/8])
+					} else {
+						disambig = string(files[fromFile]) + string(ranks[fromSq/8])
+					}
+					break
+				}
+			}
+		}
+		san += disambig
+
+		if isCapture {
+			san += "x"
+		}
+		san += string(files[toFile]) + string(ranks[toRank])
+	}
+
+	// Check for check/checkmate
+	posCopy := pos.Pack().Unpack()
+	if posCopy != nil {
+		_ = pgn.ApplyMove(posCopy, mv)
+		if posCopy.IsInCheck() {
+			moves := pgn.GenerateLegalMoves(posCopy)
+			if len(moves) == 0 {
+				san += "#"
+			} else {
+				san += "+"
+			}
+		}
+	}
+
+	return san
 }
 
 func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, uci, san string, depth, topMoves, fetchMoves int, isRoot bool) *TreeNode {
