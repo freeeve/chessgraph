@@ -1259,12 +1259,28 @@ func (ps *PositionStore) WaitForFlush() {
 }
 
 func (ps *PositionStore) flushAllInternal(blocking bool) error {
+	// Collect filenames with their sizes for sorting
+	type fileWithSize struct {
+		filename string
+		size     int
+	}
+
 	ps.dirtyMu.Lock()
-	dirtyFilenames := make([]string, 0, len(ps.dirtyBlocks))
-	for filename := range ps.dirtyBlocks {
-		dirtyFilenames = append(dirtyFilenames, filename)
+	files := make([]fileWithSize, 0, len(ps.dirtyBlocks))
+	for filename, records := range ps.dirtyBlocks {
+		files = append(files, fileWithSize{filename: filename, size: len(records)})
 	}
 	ps.dirtyMu.Unlock()
+
+	// Sort by size descending - largest blocks first so they start processing early
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].size > files[j].size
+	})
+
+	dirtyFilenames := make([]string, len(files))
+	for i, f := range files {
+		dirtyFilenames[i] = f.filename
+	}
 
 	if len(dirtyFilenames) == 0 {
 		return nil
@@ -1467,15 +1483,31 @@ func (ps *PositionStore) FlushAllV7Async() {
 }
 
 func (ps *PositionStore) flushAllV7Internal() error {
+	// Collect filenames with their sizes for sorting
+	type fileWithSize struct {
+		filename string
+		size     int
+	}
+
 	ps.dirtyMu.Lock()
-	dirtyFilenames := make([]string, 0, len(ps.dirtyBlocks))
-	for filename := range ps.dirtyBlocks {
-		dirtyFilenames = append(dirtyFilenames, filename)
+	files := make([]fileWithSize, 0, len(ps.dirtyBlocks))
+	for filename, records := range ps.dirtyBlocks {
+		files = append(files, fileWithSize{filename: filename, size: len(records)})
 	}
 	ps.dirtyMu.Unlock()
 
-	if len(dirtyFilenames) == 0 {
+	if len(files) == 0 {
 		return nil
+	}
+
+	// Sort by size descending - largest blocks first so they start processing early
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].size > files[j].size
+	})
+
+	dirtyFilenames := make([]string, len(files))
+	for i, f := range files {
+		dirtyFilenames[i] = f.filename
 	}
 
 	numWorkers := runtime.NumCPU()
