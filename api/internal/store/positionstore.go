@@ -57,6 +57,10 @@ const (
 	// Key: 32 bytes, Data: 14 bytes = 46 bytes total
 	BlockRecordSize = BlockKeySize + positionRecordSize // 32 + 14 = 46
 
+	// DirtyEntrySize estimates actual memory per dirty map entry including Go map overhead
+	// BlockKey (32) + PositionRecord (14) + map bucket overhead (~48) = ~94 bytes
+	DirtyEntrySize = 100
+
 	// PSMetaFileName is the metadata file name
 	PSMetaFileName = "posstore.meta"
 
@@ -172,10 +176,10 @@ type PositionStore struct {
 	cacheMu   sync.RWMutex
 	maxCached int
 
-	// Dirty tracking for writes - nested maps for O(1) lookup
-	dirtyBlocks    map[string]map[BlockKey]PositionRecord // filename -> key -> record
-	dirtyBytes     int64                                   // approximate memory used by dirty blocks
-	inflightBlocks map[string][]BlockRecord               // filename -> records being flushed
+	// Dirty tracking for writes - append-only slices, sorted on demand
+	dirtyBlocks    map[string]*dirtyBlock   // filename -> dirty block
+	dirtyBytes     int64                    // approximate memory used by dirty blocks
+	inflightBlocks map[string][]BlockRecord // filename -> records being flushed
 	dirtyMu        sync.Mutex
 
 	// File I/O
@@ -208,6 +212,93 @@ type psCacheEntry struct {
 	block    *psBlockCache
 }
 
+// dirtyBlock is an append-only list of records for a block file.
+// Records are sorted and compacted on-demand (for lookups or flush).
+type dirtyBlock struct {
+	records []BlockRecord // append-only until compacted
+	sorted  bool          // true if sorted and compacted (no duplicates)
+}
+
+// compact sorts records and merges duplicates.
+// After compaction, sorted=true and there are no duplicate keys.
+func (db *dirtyBlock) compact() {
+	if db.sorted || len(db.records) <= 1 {
+		db.sorted = true
+		return
+	}
+
+	// Sort by key
+	sort.Slice(db.records, func(i, j int) bool {
+		return bytes.Compare(db.records[i].Key[:], db.records[j].Key[:]) < 0
+	})
+
+	// Merge duplicates in place
+	// For same key: sum counts, take last non-zero eval fields
+	w := 0 // write index
+	for r := 0; r < len(db.records); r++ {
+		if w > 0 && db.records[w-1].Key == db.records[r].Key {
+			// Merge with previous
+			prev := &db.records[w-1]
+			curr := &db.records[r]
+
+			// Sum counts with overflow protection
+			newWins := uint32(prev.Data.Wins) + uint32(curr.Data.Wins)
+			if newWins > 65535 {
+				prev.Data.Wins = 65535
+			} else {
+				prev.Data.Wins = uint16(newWins)
+			}
+			newDraws := uint32(prev.Data.Draws) + uint32(curr.Data.Draws)
+			if newDraws > 65535 {
+				prev.Data.Draws = 65535
+			} else {
+				prev.Data.Draws = uint16(newDraws)
+			}
+			newLosses := uint32(prev.Data.Losses) + uint32(curr.Data.Losses)
+			if newLosses > 65535 {
+				prev.Data.Losses = 65535
+			} else {
+				prev.Data.Losses = uint16(newLosses)
+			}
+
+			// Take eval fields from current if non-zero
+			if curr.Data.CP != 0 || curr.Data.DTM != DTMUnknown || curr.Data.DTZ != 0 {
+				prev.Data.CP = curr.Data.CP
+				prev.Data.DTM = curr.Data.DTM
+				prev.Data.DTZ = curr.Data.DTZ
+				prev.Data.ProvenDepth = curr.Data.ProvenDepth
+			}
+		} else {
+			// New key
+			if w != r {
+				db.records[w] = db.records[r]
+			}
+			w++
+		}
+	}
+	db.records = db.records[:w]
+	db.sorted = true
+}
+
+// lookup finds a record by key, returns nil if not found.
+// Compacts if needed.
+func (db *dirtyBlock) lookup(key BlockKey) *PositionRecord {
+	db.compact()
+	idx := sort.Search(len(db.records), func(i int) bool {
+		return bytes.Compare(db.records[i].Key[:], key[:]) >= 0
+	})
+	if idx < len(db.records) && db.records[idx].Key == key {
+		return &db.records[idx].Data
+	}
+	return nil
+}
+
+// append adds a record (invalidates sorted state)
+func (db *dirtyBlock) append(rec BlockRecord) {
+	db.records = append(db.records, rec)
+	db.sorted = false
+}
+
 // NewPositionStore creates or opens a position store
 func NewPositionStore(dir string, maxCached int) (*PositionStore, error) {
 	if maxCached <= 0 {
@@ -236,7 +327,7 @@ func NewPositionStore(dir string, maxCached int) (*PositionStore, error) {
 		cache:          make(map[string]*list.Element),
 		cacheList:      list.New(),
 		maxCached:      maxCached,
-		dirtyBlocks:    make(map[string]map[BlockKey]PositionRecord),
+		dirtyBlocks:    make(map[string]*dirtyBlock),
 		inflightBlocks: make(map[string][]BlockRecord),
 		log:            func(format string, args ...any) {},
 	}
@@ -275,7 +366,7 @@ func NewPositionStoreReadOnly(dir string, maxCached int) (*PositionStore, error)
 		cache:          make(map[string]*list.Element),
 		cacheList:      list.New(),
 		maxCached:      maxCached,
-		dirtyBlocks:    make(map[string]map[BlockKey]PositionRecord),
+		dirtyBlocks:    make(map[string]*dirtyBlock),
 		inflightBlocks: make(map[string][]BlockRecord),
 		log:            func(format string, args ...any) {},
 	}
@@ -638,23 +729,24 @@ func (ps *PositionStore) Get(pos graph.PositionKey) (*PositionRecord, error) {
 	blockKey := ExtractBlockKey(pos)
 	filename := prefix.BlockFileName()
 
-	// Check dirty buffer first (O(1) map lookup), then inflight
+	// Check dirty buffer first (sorts and compacts on demand)
 	ps.dirtyMu.Lock()
-	if keyMap, ok := ps.dirtyBlocks[filename]; ok {
-		if rec, found := keyMap[blockKey]; found {
+	if db, ok := ps.dirtyBlocks[filename]; ok {
+		if rec := db.lookup(blockKey); rec != nil {
+			r := *rec // copy
 			ps.dirtyMu.Unlock()
-			r := rec // copy
 			return &r, nil
 		}
 	}
-	// Check inflight records (being flushed to disk) - still linear but small
+	// Check inflight records (being flushed to disk)
 	if records, ok := ps.inflightBlocks[filename]; ok {
-		for i := range records {
-			if records[i].Key == blockKey {
-				ps.dirtyMu.Unlock()
-				r := records[i].Data // copy
-				return &r, nil
-			}
+		idx := sort.Search(len(records), func(i int) bool {
+			return bytes.Compare(records[i].Key[:], blockKey[:]) >= 0
+		})
+		if idx < len(records) && records[idx].Key == blockKey {
+			r := records[idx].Data // copy
+			ps.dirtyMu.Unlock()
+			return &r, nil
 		}
 	}
 	ps.dirtyMu.Unlock()
@@ -694,31 +786,17 @@ func (ps *PositionStore) Put(pos graph.PositionKey, record *PositionRecord) erro
 	ps.dirtyMu.Lock()
 	defer ps.dirtyMu.Unlock()
 
-	// Get or create the inner map for this filename
-	keyMap := ps.dirtyBlocks[filename]
-	if keyMap == nil {
-		keyMap = make(map[BlockKey]PositionRecord)
-		ps.dirtyBlocks[filename] = keyMap
-		ps.dirtyBytes += int64(len(filename)) + 50 // map entry overhead
+	// Get or create the dirty block for this filename
+	db := ps.dirtyBlocks[filename]
+	if db == nil {
+		db = &dirtyBlock{records: make([]BlockRecord, 0, 64)}
+		ps.dirtyBlocks[filename] = db
+		ps.dirtyBytes += int64(len(filename)) + 50 // outer map entry overhead
 	}
 
-	// Check if key already exists - if so, merge to preserve counts from Increment
-	existing, exists := keyMap[blockKey]
-	if !exists {
-		// New entry: track memory
-		ps.dirtyBytes += BlockRecordSize
-		keyMap[blockKey] = *record
-	} else {
-		// Merge: keep existing counts (from Increment), only update eval fields
-		// This prevents race where eval worker reads stale counts from disk
-		// while Increment has already added to dirty counts
-		merged := existing
-		merged.CP = record.CP
-		merged.DTM = record.DTM
-		merged.DTZ = record.DTZ
-		merged.ProvenDepth = record.ProvenDepth
-		keyMap[blockKey] = merged
-	}
+	// Append record - merging happens at compact time
+	db.append(BlockRecord{Key: blockKey, Data: *record})
+	ps.dirtyBytes += DirtyEntrySize
 	ps.totalWrites++
 
 	return nil
@@ -740,44 +818,20 @@ func (ps *PositionStore) Increment(pos graph.PositionKey, wins, draws, losses ui
 	ps.dirtyMu.Lock()
 	defer ps.dirtyMu.Unlock()
 
-	// Get or create the inner map for this filename
-	keyMap := ps.dirtyBlocks[filename]
-	if keyMap == nil {
-		keyMap = make(map[BlockKey]PositionRecord)
-		ps.dirtyBlocks[filename] = keyMap
-		ps.dirtyBytes += int64(len(filename)) + 50 // map entry overhead
+	// Get or create the dirty block for this filename
+	db := ps.dirtyBlocks[filename]
+	if db == nil {
+		db = &dirtyBlock{records: make([]BlockRecord, 0, 64)}
+		ps.dirtyBlocks[filename] = db
+		ps.dirtyBytes += int64(len(filename)) + 50 // outer map entry overhead
 	}
 
-	// Get existing record or create new one
-	rec, exists := keyMap[blockKey]
-	if !exists {
-		ps.dirtyBytes += BlockRecordSize
-	}
-
-	// Increment counts with clamping
-	if wins > 0 {
-		if rec.Wins+wins < rec.Wins { // overflow
-			rec.Wins = 65535
-		} else {
-			rec.Wins += wins
-		}
-	}
-	if draws > 0 {
-		if rec.Draws+draws < rec.Draws {
-			rec.Draws = 65535
-		} else {
-			rec.Draws += draws
-		}
-	}
-	if losses > 0 {
-		if rec.Losses+losses < rec.Losses {
-			rec.Losses = 65535
-		} else {
-			rec.Losses += losses
-		}
-	}
-
-	keyMap[blockKey] = rec
+	// Append record with counts - merging happens at compact time
+	db.append(BlockRecord{
+		Key:  blockKey,
+		Data: PositionRecord{Wins: wins, Draws: draws, Losses: losses},
+	})
+	ps.dirtyBytes += DirtyEntrySize
 	ps.totalWrites++
 
 	return nil
@@ -1193,8 +1247,8 @@ func (ps *PositionStore) flushAllInternal(blocking bool) error {
 
 	ps.dirtyMu.Lock()
 	files := make([]fileWithSize, 0, len(ps.dirtyBlocks))
-	for filename, records := range ps.dirtyBlocks {
-		files = append(files, fileWithSize{filename: filename, size: len(records)})
+	for filename, db := range ps.dirtyBlocks {
+		files = append(files, fileWithSize{filename: filename, size: len(db.records)})
 	}
 	ps.dirtyMu.Unlock()
 
@@ -1417,8 +1471,8 @@ func (ps *PositionStore) flushAllV7Internal() error {
 
 	ps.dirtyMu.Lock()
 	files := make([]fileWithSize, 0, len(ps.dirtyBlocks))
-	for filename, records := range ps.dirtyBlocks {
-		files = append(files, fileWithSize{filename: filename, size: len(records)})
+	for filename, db := range ps.dirtyBlocks {
+		files = append(files, fileWithSize{filename: filename, size: len(db.records)})
 	}
 	ps.dirtyMu.Unlock()
 
@@ -1518,21 +1572,19 @@ func (ps *PositionStore) flushAllV7Internal() error {
 // flushBlockFileWithSize flushes a single pack file and returns bytes written
 func (ps *PositionStore) flushBlockFileWithSize(filename string) (int64, error) {
 	ps.dirtyMu.Lock()
-	keyMap, ok := ps.dirtyBlocks[filename]
-	if !ok || len(keyMap) == 0 {
+	db, ok := ps.dirtyBlocks[filename]
+	if !ok || len(db.records) == 0 {
 		ps.dirtyMu.Unlock()
 		return 0, nil
 	}
-	// Collect records from nested map into slice for merging
-	newRecords := make([]BlockRecord, 0, len(keyMap))
-	for key, data := range keyMap {
-		newRecords = append(newRecords, BlockRecord{Key: key, Data: data})
-	}
+	// Compact to merge duplicates and sort
+	db.compact()
 	// Move to inflight so Get() can still find these records during flush
+	newRecords := db.records
 	ps.inflightBlocks[filename] = newRecords
 	// Subtract memory for flushed records
-	ps.dirtyBytes -= int64(len(newRecords)) * BlockRecordSize
-	ps.dirtyBytes -= int64(len(filename)) + 50 // map entry overhead
+	ps.dirtyBytes -= int64(len(newRecords)) * DirtyEntrySize
+	ps.dirtyBytes -= int64(len(filename)) + 50 // outer map entry overhead
 	if ps.dirtyBytes < 0 {
 		ps.dirtyBytes = 0 // safety clamp
 	}
@@ -1558,11 +1610,7 @@ func (ps *PositionStore) flushBlockFileWithSize(filename string) (int64, error) 
 		return 0, fmt.Errorf("load existing: %w", err)
 	}
 
-	// Sort new records by key
-	sort.Slice(newRecords, func(i, j int) bool {
-		return bytes.Compare(newRecords[i].Key[:], newRecords[j].Key[:]) < 0
-	})
-
+	// newRecords already sorted from compact()
 	// Merge
 	merged := mergeBlockRecords(existingRecords, newRecords)
 

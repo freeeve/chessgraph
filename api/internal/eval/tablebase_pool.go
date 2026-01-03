@@ -20,15 +20,16 @@ import (
 type TablebasePoolConfig struct {
 	StockfishPath   string
 	Logger          zerolog.Logger
-	Depth           int  // Stockfish search depth for eval
-	RefutationDepth int  // Stockfish search depth for refutation (0 = Depth + 10)
-	HashMB          int  // Stockfish hash table size per worker
-	Threads         int  // Stockfish threads per worker
-	Nice            int  // Nice value for Stockfish processes (0 = disabled)
-	NumWorkers      int  // Number of parallel Stockfish workers
-	QueueSize       int  // Size of the work queue
-	MaxDepth        int  // Maximum tree depth to explore
-	RefutationOnly  bool // If true, skip DFS enumeration (only process browse/refutation queues)
+	Depth           int   // Stockfish search depth for eval
+	RefutationDepth int   // Stockfish search depth for refutation (0 = Depth + 10)
+	HashMB          int   // Stockfish hash table size per worker
+	Threads         int   // Stockfish threads per worker
+	Nice            int   // Nice value for Stockfish processes (0 = disabled)
+	NumWorkers      int   // Number of parallel Stockfish workers
+	QueueSize       int   // Size of the work queue
+	MaxDepth        int   // Maximum tree depth to explore
+	RefutationOnly  bool  // If true, skip DFS enumeration (only process browse/refutation queues)
+	DirtyMemLimit   int64 // Memory limit for dirty blocks (bytes), triggers flush when exceeded
 }
 
 // RefutationJob represents a position to prove with refutation analysis.
@@ -169,6 +170,13 @@ func (p *TablebasePool) EnqueueRefutation(job RefutationJob) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// flushIfMemoryNeeded triggers an async flush if dirty memory exceeds the limit.
+func (p *TablebasePool) flushIfMemoryNeeded() {
+	if p.cfg.DirtyMemLimit > 0 {
+		p.ps.FlushIfMemoryNeededAsync(p.cfg.DirtyMemLimit)
 	}
 }
 
@@ -479,6 +487,7 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 					Int("queue_remaining", p.browseQueue.Len()).
 					Msg("browse eval complete")
 			}
+			p.flushIfMemoryNeeded()
 			continue
 		}
 
@@ -495,6 +504,7 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 					atomic.AddInt64(&p.matesProved, 1)
 				}
 			}
+			p.flushIfMemoryNeeded()
 			continue
 		default:
 		}
@@ -512,6 +522,7 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 			if err := p.evaluatePosition(ctx, engine, packed, log); err != nil {
 				log.Warn().Err(err).Msg("eval failed")
 			}
+			p.flushIfMemoryNeeded()
 		default:
 			// No work available, wait a bit
 			time.Sleep(100 * time.Millisecond)

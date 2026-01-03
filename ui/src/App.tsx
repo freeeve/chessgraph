@@ -3,7 +3,7 @@ import ChessGraph from './ChessGraph';
 import { fetchStats, StatsResponse } from './api';
 
 function App() {
-  const [topMoves, setTopMoves] = useState(4);
+  const [topMoves, setTopMoves] = useState(3);
   const [depth, setDepth] = useState(2);
   const [stats, setStats] = useState<StatsResponse | null>(null);
 

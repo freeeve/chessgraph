@@ -57,12 +57,13 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  min-width: 200px;
-  max-width: 220px;
+  min-width: 220px;
+  max-width: 250px;
+  height: 320px; /* Match move-history height */
 }
 
 .app-title {
-  font-size: 1.1rem;
+  font-size: 1rem;
   margin: 0;
   text-align: center;
   color: #64b5f6;
@@ -77,15 +78,20 @@ h1 {
 .stats-panel {
   background: rgba(255, 255, 255, 0.05);
   border-radius: 6px;
-  padding: 0.5rem;
+  padding: 0.35rem 0.5rem;
   border: 1px solid rgba(100, 181, 246, 0.2);
+  width: fit-content;
+  min-width: 100%;
+  flex: 1; /* Grow to fill available space */
+  display: flex;
+  flex-direction: column;
 }
 
 .stats-title {
-  font-size: 0.7rem;
+  font-size: 0.65rem;
   color: rgba(255, 255, 255, 0.6);
   text-align: center;
-  margin-bottom: 0.4rem;
+  margin-bottom: 0.25rem;
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
@@ -93,12 +99,13 @@ h1 {
 .stats-grid {
   display: flex;
   flex-direction: column;
-  gap: 0.2rem;
+  gap: 0.15rem;
 }
 
 .stats-columns {
   display: flex;
-  gap: 0.5rem;
+  gap: 0.4rem;
+  flex: 1;
 }
 
 .stats-column {
@@ -109,7 +116,7 @@ h1 {
 }
 
 .stats-column:first-child {
-  padding-right: 0.5rem;
+  padding-right: 0.4rem;
   border-right: 1px solid rgba(255, 255, 255, 0.15);
 }
 
@@ -117,19 +124,22 @@ h1 {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 0.7rem;
-  gap: 0.5rem;
+  font-size: 0.65rem;
+  gap: 0.3rem;
+  white-space: nowrap;
 }
 
 .stat-value {
   color: #64b5f6;
   font-weight: 600;
   font-family: monospace;
+  flex-shrink: 0;
 }
 
 .stat-label {
   color: rgba(255, 255, 255, 0.5);
-  font-size: 0.65rem;
+  flex-shrink: 0;
+  font-size: 0.55rem;
 }
 
 .stats-readonly {
@@ -142,10 +152,11 @@ h1 {
 .controls-group {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
+  gap: 0.35rem;
   background: rgba(255, 255, 255, 0.05);
   border-radius: 6px;
   padding: 0.5rem;
+  flex-shrink: 0;
 }
 
 .control-row {
@@ -153,7 +164,7 @@ h1 {
   justify-content: space-between;
   align-items: center;
   gap: 0.5rem;
-  font-size: 0.75rem;
+  font-size: 0.8rem;
 }
 
 .control-row label {
@@ -165,8 +176,8 @@ h1 {
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 4px;
   color: rgba(255, 255, 255, 0.9);
-  padding: 0.15rem 0.3rem;
-  font-size: 0.75rem;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.8rem;
   cursor: pointer;
 }
 
@@ -294,7 +305,7 @@ h1 {
   background: rgba(255, 255, 255, 0.05);
   border-radius: 8px;
   padding: 0.5rem;
-  height: 280px;
+  height: 320px;
   width: 200px;
   overflow-y: auto;
 }
@@ -370,6 +381,12 @@ h1 {
   background: rgba(100, 181, 246, 0.15);
 }
 
+.pgn-comment {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 0.75rem;
+  font-style: italic;
+}
+
 .no-moves {
   color: rgba(255, 255, 255, 0.4);
   font-size: 0.8rem;
@@ -384,7 +401,7 @@ h1 {
   padding: 0.5rem;
   min-width: 180px;
   max-width: 220px;
-  height: 280px;
+  height: 320px;
   overflow-y: auto;
 }
 
@@ -404,7 +421,7 @@ h1 {
 
 .all-moves-row {
   display: grid;
-  grid-template-columns: 2rem 2.5rem 2.5rem 1fr;
+  grid-template-columns: 1.8rem 2.5rem 2.8rem 1fr;
   gap: 0.3rem;
   align-items: center;
   font-size: 0.7rem;
@@ -586,6 +603,23 @@ h1 {
   gap: 0.5rem;
 }
 
+.move-eval-inline {
+  font-size: 0.7rem;
+  font-weight: bold;
+}
+
+.move-eval-inline.eval-win {
+  color: #81c784;
+}
+
+.move-eval-inline.eval-loss {
+  color: #e57373;
+}
+
+.move-eval-inline.eval-draw {
+  color: rgba(255, 255, 255, 0.5);
+}
+
 .side-to-move {
   font-size: 0.7rem;
   color: rgba(255, 255, 255, 0.5);
@@ -604,6 +638,8 @@ h1 {
 .board-wrapper.focused {
   background: rgba(100, 200, 255, 0.1);
   box-shadow: 0 0 20px rgba(100, 200, 255, 0.3);
+  height: 320px;
+  justify-content: flex-start;
 }
 
 .board-wrapper.level-2,

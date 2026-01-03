@@ -95,6 +95,9 @@ func main() {
 		*stockfishPath = envPath
 	}
 
+	// Parse dirty memory limit early (needed for eval pool)
+	dirtyMemLimit := parseSize(*dirtyLimit)
+
 	logger := logx.NewLogger()
 
 	// Open position store
@@ -137,6 +140,7 @@ func main() {
 			QueueSize:       *batchSize * 10,
 			MaxDepth:        20,
 			RefutationOnly:  !*evalWorker, // Skip DFS if only doing refutation
+			DirtyMemLimit:   dirtyMemLimit,
 		}, ps)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("create eval pool")
@@ -170,9 +174,6 @@ func main() {
 			logger.Fatal().Err(err).Msg("api server")
 		}
 	}()
-
-	// Parse dirty memory limit
-	dirtyMemLimit := parseSize(*dirtyLimit)
 
 	// Create refutation scanner first (so we can pass it to ingest for pausing)
 	var scanner *eval.RefutationScanner

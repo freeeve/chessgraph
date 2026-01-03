@@ -759,7 +759,7 @@ export default function ChessGraph({
                         </span>
                       ) : null}
                     </span>
-                    <span className="move-count">{move.count.toLocaleString()}</span>
+                    <span className="move-count">{formatNumber(move.count)}</span>
                     {move.count > 0 ? (
                       <span className="move-wdl">
                         <span className="w">{move.win_pct.toFixed(0)}%</span>

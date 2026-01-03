@@ -8,7 +8,17 @@
       "Bash(find:*)",
       "Bash(go vet:*)",
       "Bash(ls:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(mkdir:*)",
+      "Bash(cat:*)",
+      "Bash(go list:*)",
+      "Bash(go tool pprof:*)",
+      "Bash(lsof:*)",
+      "Bash(xargs kill:*)",
+      "Bash(./api:*)",
+      "Bash(git checkout:*)",
+      "Bash(curl:*)",
+      "WebSearch"
     ]
   }
 }
