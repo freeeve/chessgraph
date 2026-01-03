@@ -431,103 +431,6 @@ func mvToUCI(mv pgn.Mv) string {
 	return uci
 }
 
-// uciToSAN converts a UCI move to SAN notation given the current position
-func uciToSAN(pos *pgn.GameState, mv pgn.Mv) string {
-	// Check for castling
-	if mv.Flags == 4 {
-		if mv.To > mv.From {
-			return "O-O"
-		}
-		return "O-O-O"
-	}
-
-	fromSq := int(mv.From)
-	toSq := int(mv.To)
-	fromFile := fromSq % 8
-	toFile := toSq % 8
-	toRank := toSq / 8
-
-	files := "abcdefgh"
-	ranks := "12345678"
-
-	piece := pos.PieceAt(mv.From)
-	isPawn := piece == 'P' || piece == 'p'
-	isCapture := pos.PieceAt(mv.To) != 0 || (isPawn && mv.Flags == 2)
-
-	var san string
-
-	if isPawn {
-		if isCapture {
-			san = string(files[fromFile]) + "x" + string(files[toFile]) + string(ranks[toRank])
-		} else {
-			san = string(files[toFile]) + string(ranks[toRank])
-		}
-		switch mv.Promo {
-		case pgn.PromoQueen:
-			san += "=Q"
-		case pgn.PromoRook:
-			san += "=R"
-		case pgn.PromoBishop:
-			san += "=B"
-		case pgn.PromoKnight:
-			san += "=N"
-		}
-	} else {
-		pieceChar := piece
-		if piece >= 'a' && piece <= 'z' {
-			pieceChar = piece - 32
-		}
-		san = string(pieceChar)
-
-		// Check for disambiguation
-		disambig := ""
-		moves := pgn.GenerateLegalMoves(pos)
-		for _, other := range moves {
-			if other.To == mv.To && other.From != mv.From {
-				otherPiece := pos.PieceAt(other.From)
-				otherUpper := otherPiece
-				if otherPiece >= 'a' && otherPiece <= 'z' {
-					otherUpper = otherPiece - 32
-				}
-				if otherUpper == pieceChar {
-					otherFromFile := int(other.From) % 8
-					otherFromRank := int(other.From) / 8
-					if fromFile != otherFromFile {
-						disambig = string(files[fromFile])
-					} else if fromSq/8 != otherFromRank {
-						disambig = string(ranks[fromSq/8])
-					} else {
-						disambig = string(files[fromFile]) + string(ranks[fromSq/8])
-					}
-					break
-				}
-			}
-		}
-		san += disambig
-
-		if isCapture {
-			san += "x"
-		}
-		san += string(files[toFile]) + string(ranks[toRank])
-	}
-
-	// Check for check/checkmate
-	posCopy := pos.Pack().Unpack()
-	if posCopy != nil {
-		_ = pgn.ApplyMove(posCopy, mv)
-		if posCopy.IsInCheck() {
-			moves := pgn.GenerateLegalMoves(posCopy)
-			if len(moves) == 0 {
-				san += "#"
-			} else {
-				san += "+"
-			}
-		}
-	}
-
-	return san
-}
-
 func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, uci, san string, depth, topMoves, fetchMoves int, isRoot bool) *TreeNode {
 	node := &TreeNode{
 		Position: posKey.String(),
@@ -601,7 +504,7 @@ func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, u
 				continue
 			}
 
-			sanStr := mvToSAN(pos, mv)
+			sanStr := mvToSAN(pos, mv, moves)
 
 			if err := pgn.ApplyMove(childPos, mv); err != nil {
 				continue
@@ -693,7 +596,8 @@ func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, u
 }
 
 // mvToSAN converts a move to SAN notation
-func mvToSAN(pos *pgn.GameState, mv pgn.Mv) string {
+// If allMoves is provided, it will be used for disambiguation instead of regenerating legal moves
+func mvToSAN(pos *pgn.GameState, mv pgn.Mv, allMoves []pgn.Mv) string {
 	// Check for castling
 	if mv.Flags == 4 {
 		if mv.To > mv.From {
@@ -743,10 +647,9 @@ func mvToSAN(pos *pgn.GameState, mv pgn.Mv) string {
 		}
 		san = string(pieceChar)
 
-		// Check for disambiguation
+		// Check for disambiguation using provided moves (avoid regenerating)
 		disambig := ""
-		moves := pgn.GenerateLegalMoves(pos)
-		for _, other := range moves {
+		for _, other := range allMoves {
 			if other.To == mv.To && other.From != mv.From {
 				otherPiece := pos.PieceAt(other.From)
 				// Compare case-insensitively
@@ -777,19 +680,8 @@ func mvToSAN(pos *pgn.GameState, mv pgn.Mv) string {
 		san += string(files[toFile]) + string(ranks[toRank])
 	}
 
-	// Check for check/checkmate
-	posCopy := pos.Pack().Unpack()
-	if posCopy != nil {
-		_ = pgn.ApplyMove(posCopy, mv)
-		if posCopy.IsInCheck() {
-			moves := pgn.GenerateLegalMoves(posCopy)
-			if len(moves) == 0 {
-				san += "#"
-			} else {
-				san += "+"
-			}
-		}
-	}
+	// Skip check/checkmate annotation for performance
+	// The UI can detect check/mate from the game state if needed
 
 	return san
 }
