@@ -464,13 +464,17 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 
 		// Check browse queue first (highest priority)
 		if browsePos, ok := p.browseQueue.Dequeue(); ok {
-			log.Debug().Str("position", browsePos.String()).Msg("processing browse queue position")
+			browseFen := ""
+			if pos := browsePos.Unpack(); pos != nil {
+				browseFen = pos.ToFEN()
+			}
+			log.Debug().Str("fen", browseFen).Msg("processing browse queue position")
 			if err := p.evaluatePosition(ctx, engine, browsePos, log); err != nil {
-				log.Warn().Err(err).Msg("browse eval failed")
+				log.Warn().Err(err).Str("fen", browseFen).Msg("browse eval failed")
 			} else {
 				atomic.AddInt64(&p.browseEvaled, 1)
 				log.Info().
-					Str("position", browsePos.String()).
+					Str("fen", browseFen).
 					Int64("total_browse_evaled", atomic.LoadInt64(&p.browseEvaled)).
 					Int("queue_remaining", p.browseQueue.Len()).
 					Msg("browse eval complete")
