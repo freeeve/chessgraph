@@ -261,8 +261,8 @@ func (db *dirtyBlock) compact() {
 				prev.Data.Losses = uint16(newLosses)
 			}
 
-			// Take eval fields from current if non-zero
-			if curr.Data.CP != 0 || curr.Data.DTM != DTMUnknown || curr.Data.DTZ != 0 {
+			// Take eval fields from current if it has eval data
+			if curr.Data.HasCP() || curr.Data.DTM != DTMUnknown || curr.Data.DTZ != 0 {
 				prev.Data.CP = curr.Data.CP
 				prev.Data.DTM = curr.Data.DTM
 				prev.Data.DTZ = curr.Data.DTZ
@@ -723,54 +723,78 @@ func (p PSPrefix) Path() string {
 	return filepath.Join(p.FolderName(), p.FileName())
 }
 
-// Get retrieves a position record by its key
+// Get retrieves a position record by its key.
+// Dirty records are merged with disk data to ensure we don't lose eval
+// data when only counts are updated in the dirty block.
 func (ps *PositionStore) Get(pos graph.PositionKey) (*PositionRecord, error) {
 	prefix := ExtractPrefix(pos)
 	blockKey := ExtractBlockKey(pos)
 	filename := prefix.BlockFileName()
 
-	// Check dirty buffer first (sorts and compacts on demand)
+	// Check dirty buffer and inflight (sorts and compacts on demand)
+	var dirtyRec *PositionRecord
 	ps.dirtyMu.Lock()
 	if db, ok := ps.dirtyBlocks[filename]; ok {
 		if rec := db.lookup(blockKey); rec != nil {
 			r := *rec // copy
-			ps.dirtyMu.Unlock()
-			return &r, nil
+			dirtyRec = &r
 		}
 	}
 	// Check inflight records (being flushed to disk)
-	if records, ok := ps.inflightBlocks[filename]; ok {
-		idx := sort.Search(len(records), func(i int) bool {
-			return bytes.Compare(records[i].Key[:], blockKey[:]) >= 0
-		})
-		if idx < len(records) && records[idx].Key == blockKey {
-			r := records[idx].Data // copy
-			ps.dirtyMu.Unlock()
-			return &r, nil
+	if dirtyRec == nil {
+		if records, ok := ps.inflightBlocks[filename]; ok {
+			idx := sort.Search(len(records), func(i int) bool {
+				return bytes.Compare(records[i].Key[:], blockKey[:]) >= 0
+			})
+			if idx < len(records) && records[idx].Key == blockKey {
+				r := records[idx].Data // copy
+				dirtyRec = &r
+			}
 		}
 	}
 	ps.dirtyMu.Unlock()
 
-	// Load block file
+	// Load block file to get disk data
 	block, err := ps.getBlockFile(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrPSKeyNotFound
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 
-	// Binary search for key
-	idx := sort.Search(len(block.records), func(i int) bool {
-		return bytes.Compare(block.records[i].Key[:], blockKey[:]) >= 0
-	})
-
-	if idx < len(block.records) && block.records[idx].Key == blockKey {
-		r := block.records[idx].Data // copy
-		return &r, nil
+	// Find on disk
+	var diskRec *PositionRecord
+	if block != nil {
+		idx := sort.Search(len(block.records), func(i int) bool {
+			return bytes.Compare(block.records[i].Key[:], blockKey[:]) >= 0
+		})
+		if idx < len(block.records) && block.records[idx].Key == blockKey {
+			r := block.records[idx].Data // copy
+			diskRec = &r
+		}
 	}
 
-	return nil, ErrPSKeyNotFound
+	// Merge dirty and disk data
+	if dirtyRec == nil && diskRec == nil {
+		return nil, ErrPSKeyNotFound
+	}
+	if dirtyRec == nil {
+		return diskRec, nil
+	}
+	if diskRec == nil {
+		return dirtyRec, nil
+	}
+
+	// Both exist - merge: sum counts, keep eval from dirty if it has one, else disk
+	merged := *diskRec
+	merged.Wins = uint16(min(65535, int(merged.Wins)+int(dirtyRec.Wins)))
+	merged.Draws = uint16(min(65535, int(merged.Draws)+int(dirtyRec.Draws)))
+	merged.Losses = uint16(min(65535, int(merged.Losses)+int(dirtyRec.Losses)))
+	if dirtyRec.HasCP() || dirtyRec.DTM != DTMUnknown || dirtyRec.DTZ != 0 {
+		merged.CP = dirtyRec.CP
+		merged.DTM = dirtyRec.DTM
+		merged.DTZ = dirtyRec.DTZ
+		merged.ProvenDepth = dirtyRec.ProvenDepth
+	}
+	return &merged, nil
 }
 
 // Put stores or updates a position record
@@ -1672,7 +1696,7 @@ func mergeBlockRecords(existing, newer []BlockRecord) []BlockRecord {
 				merged.Losses = uint16(newLosses)
 			}
 			// Keep evaluation data from newer if it has any, otherwise keep existing
-			if newer[j].Data.CP != 0 || newer[j].Data.DTM != DTMUnknown || newer[j].Data.DTZ != 0 {
+			if newer[j].Data.HasCP() || newer[j].Data.DTM != DTMUnknown || newer[j].Data.DTZ != 0 {
 				merged.CP = newer[j].Data.CP
 				merged.DTM = newer[j].Data.DTM
 				merged.DTZ = newer[j].Data.DTZ
