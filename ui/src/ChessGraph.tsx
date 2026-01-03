@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Chessboard } from 'react-chessboard';
-import { fetchTree, TreeNode, StatsResponse, fetchPositionByFen } from './api';
+import { fetchTree, fetchTreeWithMoves, TreeNode, PathNode, StatsResponse, fetchPositionByFen } from './api';
 
 // Custom hook to get previous value
 function usePrevious<T>(value: T): T | undefined {
@@ -45,13 +45,13 @@ function getBoardOrientation(mode: BoardOrientation, fen: string): 'white' | 'bl
 
 interface NavigationState {
   current: TreeNode;
-  parents: TreeNode[];
-  lastMoveUci?: string;  // UCI move that led to current position (for highlighting)
+  parents: TreeNode[];      // Parent nodes for move history display
+  uciMoves: string[];       // UCI moves from starting position (for URL)
+  lastMoveUci?: string;     // UCI move that led to current position (for highlighting)
 }
 
 interface UrlState {
-  position?: string;
-  path: string[];  // Parent position keys
+  moves: string[];  // UCI moves from starting position
   topMoves?: number;
   depth?: number;
 }
@@ -71,6 +71,12 @@ function formatNumber(n: number | undefined): string {
   return n.toString();
 }
 
+// Format numbers with exact count (with commas)
+function formatExact(n: number | undefined): string {
+  if (n === undefined || n === null) return '0';
+  return n.toLocaleString();
+}
+
 // Format byte sizes with appropriate units
 function formatBytes(bytes: number | undefined): string {
   if (bytes === undefined || bytes === null) return '0 B';
@@ -80,32 +86,28 @@ function formatBytes(bytes: number | undefined): string {
   return bytes + ' B';
 }
 
-// Parse URL state from hash and query params
+// Parse URL state from hash - moves are in the hash as e2e4/e7e5/...
 function getStateFromUrl(): UrlState {
   const hash = window.location.hash.slice(1); // Remove '#'
   const params = new URLSearchParams(window.location.search);
 
-  const pathParam = params.get('path');
-  const path = pathParam ? pathParam.split(',').filter(Boolean) : [];
+  // Parse moves from hash: #e2e4/e7e5/g1f3/...
+  const moves = hash ? hash.split('/').filter(Boolean) : [];
 
-  const topMovesParam = params.get('moves');
+  const topMovesParam = params.get('moves');  // Note: 'moves' param is for display count
   const depthParam = params.get('depth');
 
   return {
-    position: hash || undefined,
-    path,
+    moves,
     topMoves: topMovesParam ? parseInt(topMovesParam, 10) : undefined,
     depth: depthParam ? parseInt(depthParam, 10) : undefined,
   };
 }
 
-// Update URL with current state
-function updateUrl(position?: string, path: string[] = [], topMoves?: number, depth?: number) {
+// Update URL with current state - moves go in hash as e2e4/e7e5/...
+function updateUrl(uciMoves: string[] = [], topMoves?: number, depth?: number) {
   const params = new URLSearchParams();
 
-  if (path.length > 0) {
-    params.set('path', path.join(','));
-  }
   if (topMoves !== undefined) {
     params.set('moves', topMoves.toString());
   }
@@ -114,7 +116,7 @@ function updateUrl(position?: string, path: string[] = [], topMoves?: number, de
   }
 
   const queryString = params.toString();
-  const newHash = position ? `#${position}` : '';
+  const newHash = uciMoves.length > 0 ? `#${uciMoves.join('/')}` : '';
   const newUrl = queryString
     ? `${window.location.pathname}?${queryString}${newHash}`
     : `${window.location.pathname}${newHash}`;
@@ -125,7 +127,7 @@ function updateUrl(position?: string, path: string[] = [], topMoves?: number, de
 }
 
 export default function ChessGraph({
-  topMoves: propTopMoves = 4,
+  topMoves: propTopMoves = 3,
   fetchMoves = 218,  // Fetch all possible moves from a position
   depth: propDepth = 2,
   stats,
@@ -165,25 +167,59 @@ export default function ChessGraph({
   const [fenInput, setFenInput] = useState('');
   const [fenError, setFenError] = useState<string | null>(null);
 
-  // Fetch at least as many as we display
-  const loadTree = useCallback(async (positionKey?: string, parents: TreeNode[] = [], updateHistory = true, lastMoveUci?: string, currentSan?: string) => {
+  // Load tree - can use UCI moves (preferred) or position key (fallback for FEN input)
+  const loadTree = useCallback(async (
+    uciMoves: string[],
+    updateHistory = true,
+    positionKeyOverride?: string  // For FEN input where we don't have moves
+  ) => {
     setLoading(true);
     setError(null);
 
     try {
-      const tree = await fetchTree(positionKey, depth, topMoves, fetchMoves);
-      // Apply san if provided (needed when loading from URL)
-      if (currentSan) {
-        tree.san = currentSan;
+      let tree: TreeNode;
+      let parents: TreeNode[] = [];
+      let lastMoveUci: string | undefined;
+
+      if (positionKeyOverride) {
+        // Direct position access (e.g., from FEN input) - no path
+        tree = await fetchTree(positionKeyOverride, depth, topMoves, fetchMoves);
+      } else if (uciMoves.length > 0) {
+        // Use moves parameter - single API call returns path
+        tree = await fetchTreeWithMoves(uciMoves, depth, topMoves, fetchMoves);
+        lastMoveUci = uciMoves[uciMoves.length - 1];
+
+        // Build parents from the returned path
+        if (tree.path) {
+          parents = tree.path.map((p: PathNode) => ({
+            position: p.position,
+            fen: p.fen,
+            uci: p.uci,
+            san: p.san,
+            count: 0,
+            wins: 0,
+            draws: 0,
+            losses: 0,
+            win_pct: 0,
+            draw_pct: 0,
+          }));
+          // Remove last element - that's the current position, not a parent
+          parents.pop();
+          // Set current node's san/uci from path
+          const lastPath = tree.path[tree.path.length - 1];
+          if (lastPath) {
+            tree.san = lastPath.san;
+            tree.uci = lastPath.uci;
+          }
+        }
+      } else {
+        // Starting position
+        tree = await fetchTree(undefined, depth, topMoves, fetchMoves);
       }
-      // Apply uci if provided
-      if (lastMoveUci) {
-        tree.uci = lastMoveUci;
-      }
-      setNavState({ current: tree, parents, lastMoveUci });
+
+      setNavState({ current: tree, parents, uciMoves, lastMoveUci });
       if (updateHistory) {
-        const parentKeys = parents.map(p => p.position);
-        updateUrl(positionKey, parentKeys, topMoves, depth);
+        updateUrl(uciMoves, topMoves, depth);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load position');
@@ -192,119 +228,17 @@ export default function ChessGraph({
     }
   }, [depth, topMoves, fetchMoves]);
 
-  // Load initial position from URL, reconstructing parent path if needed
+  // Load initial position from URL - single API call with moves parameter
   useEffect(() => {
-    const loadFromUrl = async () => {
-      const state = getStateFromUrl();
-
-      // If we have a path, we need to fetch each parent position to reconstruct the tree nodes
-      // We also need to look up san/uci for each position from the previous parent's children
-      const parents: TreeNode[] = [];
-      let prevNode: TreeNode | null = null;
-
-      // If we have parents to reconstruct, start from the starting position to get first parent's san/uci
-      if (state.path.length > 0) {
-        try {
-          prevNode = await fetchTree(undefined, 1, 4, 218); // Fetch starting position with children
-        } catch {
-          console.warn('Could not fetch starting position');
-        }
-      }
-
-      for (const posKey of state.path) {
-        try {
-          const parentNode = await fetchTree(posKey, 1, 4, 218); // Fetch with depth 1 to get children
-
-          // Look up this node's san/uci from previous node's children
-          if (prevNode && prevNode.children) {
-            const matchingChild = prevNode.children.find(c => c.position === posKey);
-            if (matchingChild) {
-              parentNode.san = matchingChild.san;
-              parentNode.uci = matchingChild.uci;
-            }
-          }
-
-          parents.push(parentNode);
-          prevNode = parentNode;
-        } catch {
-          // If we can't fetch a parent, just skip it
-          console.warn('Could not fetch parent position:', posKey);
-        }
-      }
-
-      // Try to find the UCI/SAN move that led to the current position
-      let lastMoveUci: string | undefined;
-      let currentSan: string | undefined;
-      if (state.position && parents.length > 0) {
-        const lastParent = parents[parents.length - 1];
-        if (lastParent.children) {
-          const matchingChild = lastParent.children.find(c => c.position === state.position);
-          if (matchingChild) {
-            lastMoveUci = matchingChild.uci;
-            currentSan = matchingChild.san;
-          }
-        }
-      }
-
-      loadTree(state.position, parents, false, lastMoveUci, currentSan);
-    };
-
-    loadFromUrl();
+    const state = getStateFromUrl();
+    loadTree(state.moves, false);
   }, []); // Only run on mount
 
   // Handle browser back/forward navigation
   useEffect(() => {
-    const handlePopState = async () => {
+    const handlePopState = () => {
       const state = getStateFromUrl();
-
-      // Reconstruct parents from path
-      const parents: TreeNode[] = [];
-      let prevNode: TreeNode | null = null;
-
-      // If we have parents to reconstruct, start from the starting position
-      if (state.path.length > 0) {
-        try {
-          prevNode = await fetchTree(undefined, 1, 4, 218);
-        } catch {
-          console.warn('Could not fetch starting position');
-        }
-      }
-
-      for (const posKey of state.path) {
-        try {
-          const parentNode = await fetchTree(posKey, 1, 4, 218);
-
-          // Look up this node's san/uci from previous node's children
-          if (prevNode && prevNode.children) {
-            const matchingChild = prevNode.children.find(c => c.position === posKey);
-            if (matchingChild) {
-              parentNode.san = matchingChild.san;
-              parentNode.uci = matchingChild.uci;
-            }
-          }
-
-          parents.push(parentNode);
-          prevNode = parentNode;
-        } catch {
-          console.warn('Could not fetch parent position:', posKey);
-        }
-      }
-
-      // Try to find the UCI/SAN move that led to the current position
-      let lastMoveUci: string | undefined;
-      let currentSan: string | undefined;
-      if (state.position && parents.length > 0) {
-        const lastParent = parents[parents.length - 1];
-        if (lastParent.children) {
-          const matchingChild = lastParent.children.find(c => c.position === state.position);
-          if (matchingChild) {
-            lastMoveUci = matchingChild.uci;
-            currentSan = matchingChild.san;
-          }
-        }
-      }
-
-      loadTree(state.position, parents, false, lastMoveUci, currentSan);
+      loadTree(state.moves, false);
     };
 
     window.addEventListener('popstate', handlePopState);
@@ -321,31 +255,25 @@ export default function ChessGraph({
     const depthChanged = prevDepth !== undefined && prevDepth !== depth;
 
     if (navState && hasAppliedUrlState && (topMovesChanged || depthChanged)) {
-      // Reload with same position but new parameters
-      const positionKey = navState.current.position;
-      loadTree(
-        positionKey,
-        navState.parents,
-        true,
-        navState.lastMoveUci,
-        navState.current.san
-      );
+      // Reload with same moves but new parameters
+      loadTree(navState.uciMoves, true);
     }
   }, [topMoves, depth, prevTopMoves, prevDepth, navState, hasAppliedUrlState, loadTree]);
 
   const handleNodeClick = (node: TreeNode, ancestors: TreeNode[] = []) => {
-    if (navState && node.position !== navState.current.position) {
-      // Build full parent chain: existing parents + current + any intermediate ancestors
-      const fullParents = [...navState.parents, navState.current, ...ancestors];
-      loadTree(node.position, fullParents, true, node.uci, node.san);
+    if (navState && node.position !== navState.current.position && node.uci) {
+      // Append UCIs for all ancestors + the clicked node
+      const ancestorUcis = ancestors.map(a => a.uci).filter((u): u is string => !!u);
+      const newMoves = [...navState.uciMoves, ...ancestorUcis, node.uci];
+      loadTree(newMoves, true);
     }
   };
 
   const handleGoToParent = () => {
-    if (navState && navState.parents.length > 0) {
-      const newParents = [...navState.parents];
-      const parent = newParents.pop()!;
-      loadTree(parent.position, newParents, true, parent.uci, parent.san);
+    if (navState && navState.uciMoves.length > 0) {
+      // Remove last move to go back
+      const newMoves = navState.uciMoves.slice(0, -1);
+      loadTree(newMoves, true);
     }
   };
 
@@ -359,8 +287,8 @@ export default function ChessGraph({
     setFenError(null);
     try {
       const result = await fetchPositionByFen(fenInput.trim());
-      // Load the position with no parents (fresh navigation)
-      loadTree(result.position, [], true);
+      // Load the position directly (no move history since we jumped to a FEN)
+      loadTree([], true, result.position);
       setShowFenDialog(false);
       setFenInput('');
     } catch (err) {
@@ -386,8 +314,9 @@ export default function ChessGraph({
     // Find child with matching UCI move
     const matchingChild = current.children.find(child => child.uci === uci);
 
-    if (matchingChild) {
-      loadTree(matchingChild.position, [...navState.parents, current], true, matchingChild.uci, matchingChild.san);
+    if (matchingChild && matchingChild.uci) {
+      const newMoves = [...navState.uciMoves, matchingChild.uci];
+      loadTree(newMoves, true);
       return true;
     }
 
@@ -396,8 +325,9 @@ export default function ChessGraph({
       for (const promo of ['r', 'b', 'n']) {
         const promoUci = sourceSquare + targetSquare + promo;
         const promoChild = current.children.find(child => child.uci === promoUci);
-        if (promoChild) {
-          loadTree(promoChild.position, [...navState.parents, current], true, promoChild.uci, promoChild.san);
+        if (promoChild && promoChild.uci) {
+          const newMoves = [...navState.uciMoves, promoChild.uci];
+          loadTree(newMoves, true);
           return true;
         }
       }
@@ -411,23 +341,63 @@ export default function ChessGraph({
     return `${node.count.toLocaleString()}`;
   };
 
+  // CPUnknown sentinel value from backend (-32767 means no Stockfish evaluation)
+  const CP_UNKNOWN = -32767;
+
+  const hasValidCP = (cp: number | undefined): boolean => {
+    return cp !== undefined && cp !== CP_UNKNOWN;
+  };
+
   const formatEval = (node: TreeNode): string | null => {
     if (node.dtm) {
       const sign = node.dtm > 0 ? '+' : '';
       return `M${sign}${node.dtm}`;
     }
-    if (node.cp !== undefined && node.cp !== 0) {
-      const sign = node.cp > 0 ? '+' : '';
-      return `${sign}${(node.cp / 100).toFixed(2)}`;
+    if (hasValidCP(node.cp)) {
+      const sign = node.cp! > 0 ? '+' : '';
+      return `${sign}${(node.cp! / 100).toFixed(2)}`;
     }
     return null;
+  };
+
+  const getEvalClass = (node: TreeNode, parentFen?: string): string => {
+    // When showing child moves, we want to color from the perspective of who made the move
+    // parentFen tells us who was to move before this position was reached
+    // If parentFen has white to move, then WHITE made the move to reach this child
+
+    let whiteMadeTheMove: boolean;
+    if (parentFen) {
+      // Parent's side to move is who made this move
+      whiteMadeTheMove = getSideToMove(parentFen) === 'white';
+    } else {
+      // No parent - we're showing current position, color for side to move
+      // Positive = good for white, so if white to move, positive is good
+      whiteMadeTheMove = getSideToMove(node.fen) === 'white';
+    }
+
+    if (node.dtm) {
+      // Positive DTM = white winning, negative = black winning
+      const isGoodForMover = whiteMadeTheMove ? node.dtm > 0 : node.dtm < 0;
+      const isBadForMover = whiteMadeTheMove ? node.dtm < 0 : node.dtm > 0;
+      if (isGoodForMover) return 'eval-win';
+      if (isBadForMover) return 'eval-loss';
+      return 'eval-draw';
+    }
+    if (hasValidCP(node.cp)) {
+      // Positive CP = white advantage, negative = black advantage
+      const isGoodForMover = whiteMadeTheMove ? node.cp! > 0 : node.cp! < 0;
+      const isBadForMover = whiteMadeTheMove ? node.cp! < 0 : node.cp! > 0;
+      if (isGoodForMover) return 'eval-win';
+      if (isBadForMover) return 'eval-loss';
+    }
+    return 'eval-draw';
   };
 
   // Build PGN-style move list from parents + current (must be before early returns)
   const moveHistory = useMemo(() => {
     if (!navState) return [];
     const { current, parents } = navState;
-    const moves: { moveNumber: number; white?: string; black?: string; node: TreeNode }[] = [];
+    const moves: { moveNumber: number; white?: string; black?: string; whiteNode?: TreeNode; blackNode?: TreeNode }[] = [];
     const allNodes = [...parents, current].filter(n => n.san); // Exclude starting position
 
     for (let i = 0; i < allNodes.length; i++) {
@@ -436,37 +406,55 @@ export default function ChessGraph({
       const isWhiteMove = i % 2 === 0;
 
       if (isWhiteMove) {
-        moves.push({ moveNumber, white: node.san, node });
+        moves.push({ moveNumber, white: node.san, whiteNode: node });
       } else {
         if (moves.length > 0) {
           moves[moves.length - 1].black = node.san;
+          moves[moves.length - 1].blackNode = node;
         }
       }
     }
     return moves;
   }, [navState]);
 
+  // Format score for PGN comment
+  const formatPgnScore = (node: TreeNode | undefined): string | null => {
+    if (!node) return null;
+    if (node.dtm) {
+      return `M${node.dtm > 0 ? '+' : ''}${node.dtm}`;
+    }
+    if (hasValidCP(node.cp)) {
+      const score = node.cp! / 100;
+      return `${score > 0 ? '+' : ''}${score.toFixed(1)}`;
+    }
+    return null;
+  };
+
   // Sort all possible moves: by score (cp/dtm) descending, then count, then win%
   const sortedMoves = useMemo(() => {
     if (!navState || !navState.current.children) return [];
     const children = [...navState.current.children];
 
+    // Determine if it's black to move - if so, lower evals are better
+    const isBlackToMove = getSideToMove(navState.current.fen) === 'black';
+    const evalMultiplier = isBlackToMove ? -1 : 1;
+
     return children.sort((a, b) => {
-      // First priority: positions with evaluation (cp or dtm)
-      const aHasEval = a.cp !== undefined || a.dtm !== undefined;
-      const bHasEval = b.cp !== undefined || b.dtm !== undefined;
+      // First priority: positions with evaluation (valid cp or dtm)
+      const aHasEval = hasValidCP(a.cp) || a.dtm !== undefined;
+      const bHasEval = hasValidCP(b.cp) || b.dtm !== undefined;
 
       if (aHasEval && bHasEval) {
         // Both have evals - compare them
         // DTM takes priority (mate is better/worse than centipawns)
         if (a.dtm !== undefined && b.dtm !== undefined) {
-          return b.dtm - a.dtm; // Higher DTM is better (positive = winning)
+          return (b.dtm - a.dtm) * evalMultiplier;
         }
         if (a.dtm !== undefined) return -1; // a has mate, prioritize
         if (b.dtm !== undefined) return 1;  // b has mate, prioritize
 
         // Both have centipawn evals
-        return (b.cp ?? 0) - (a.cp ?? 0);
+        return ((b.cp ?? 0) - (a.cp ?? 0)) * evalMultiplier;
       }
 
       if (aHasEval) return -1; // a has eval, b doesn't
@@ -492,7 +480,7 @@ export default function ChessGraph({
     return <div className="error">No data</div>;
   }
 
-  const { current, parents, lastMoveUci } = navState;
+  const { current, lastMoveUci } = navState;
 
   // Get the last move made for highlighting on the main board
   // Use lastMoveUci if available (from navigation), otherwise fall back to current.uci (from API)
@@ -521,7 +509,7 @@ export default function ChessGraph({
                     <span className="stat-label">positions</span>
                   </div>
                   <div className="stat-item">
-                    <span className="stat-value">{formatNumber(stats.evaluated_positions)}</span>
+                    <span className="stat-value">{formatExact(stats.evaluated_positions)}</span>
                     <span className="stat-label">evaluated</span>
                   </div>
                   <div className="stat-item">
@@ -532,12 +520,24 @@ export default function ChessGraph({
                     <span className="stat-value">{formatNumber(stats.dtz_positions)}</span>
                     <span className="stat-label">pos w/ DTZ</span>
                   </div>
+                  {stats.compressed_bytes > 0 && stats.total_positions > 0 && (
+                    <div className="stat-item">
+                      <span className="stat-value">{((stats.compressed_bytes * 8) / stats.total_positions).toFixed(3)}</span>
+                      <span className="stat-label">bits/pos</span>
+                    </div>
+                  )}
                 </div>
                 <div className="stats-column">
                   <div className="stat-item">
                     <span className="stat-value">{formatNumber(stats.total_blocks)}</span>
                     <span className="stat-label">blocks</span>
                   </div>
+                  {stats.total_blocks > 0 && stats.total_positions > 0 && (
+                    <div className="stat-item">
+                      <span className="stat-value">{(stats.total_positions / stats.total_blocks).toFixed(1)}</span>
+                      <span className="stat-label">pos/block</span>
+                    </div>
+                  )}
                   <div className="stat-item">
                     <span className="stat-value">{formatBytes(stats.uncompressed_bytes)}</span>
                     <span className="stat-label">size</span>
@@ -548,13 +548,13 @@ export default function ChessGraph({
                   </div>
                   {stats.uncompressed_bytes > 0 && stats.compressed_bytes > 0 && (
                     <div className="stat-item">
-                      <span className="stat-value">{(stats.uncompressed_bytes / stats.compressed_bytes).toFixed(4)}x</span>
+                      <span className="stat-value">{(stats.uncompressed_bytes / stats.compressed_bytes).toFixed(3)}x</span>
                       <span className="stat-label">compress</span>
                     </div>
                   )}
                   {stats.compressed_bytes > 0 && stats.total_positions > 0 && (
                     <div className="stat-item">
-                      <span className="stat-value">{(stats.compressed_bytes / stats.total_positions).toFixed(3)}</span>
+                      <span className="stat-value">{(stats.compressed_bytes / stats.total_positions).toFixed(4)}</span>
                       <span className="stat-label">bytes/pos</span>
                     </div>
                   )}
@@ -645,7 +645,7 @@ export default function ChessGraph({
             <button
               className="back-btn"
               onClick={handleGoToParent}
-              disabled={parents.length === 0}
+              disabled={navState.uciMoves.length === 0}
               title="Go back"
             >
               ←
@@ -662,34 +662,32 @@ export default function ChessGraph({
                   <span
                     className="white-move clickable"
                     onClick={() => {
-                      // Navigate to this position: find the node index and rebuild parents
-                      const nodeIndex = idx * 2; // White moves are at even indices
-                      const allNodes = [...parents, current].filter(n => n.san);
-                      if (nodeIndex < allNodes.length) {
-                        const targetNode = allNodes[nodeIndex];
-                        const newParents = allNodes.slice(0, nodeIndex);
-                        loadTree(targetNode.position, newParents, true, targetNode.uci, targetNode.san);
-                      }
+                      // Navigate to this position using the first N moves
+                      const moveIndex = idx * 2 + 1; // +1 because uciMoves[0] leads to move 1
+                      const newMoves = navState.uciMoves.slice(0, moveIndex);
+                      loadTree(newMoves, true);
                     }}
                   >
                     {move.white || ''}
                   </span>
+                  {formatPgnScore(move.whiteNode) && (
+                    <span className="pgn-comment">{`{${formatPgnScore(move.whiteNode)}}`}</span>
+                  )}
                   <span
                     className={`black-move ${move.black ? 'clickable' : ''}`}
                     onClick={() => {
                       if (!move.black) return;
-                      // Navigate to this position: find the node index and rebuild parents
-                      const nodeIndex = idx * 2 + 1; // Black moves are at odd indices
-                      const allNodes = [...parents, current].filter(n => n.san);
-                      if (nodeIndex < allNodes.length) {
-                        const targetNode = allNodes[nodeIndex];
-                        const newParents = allNodes.slice(0, nodeIndex);
-                        loadTree(targetNode.position, newParents, true, targetNode.uci, targetNode.san);
-                      }
+                      // Navigate to this position using the first N moves
+                      const moveIndex = idx * 2 + 2; // +2 for black's move
+                      const newMoves = navState.uciMoves.slice(0, moveIndex);
+                      loadTree(newMoves, true);
                     }}
                   >
                     {move.black || ''}
                   </span>
+                  {formatPgnScore(move.blackNode) && (
+                    <span className="pgn-comment">{`{${formatPgnScore(move.blackNode)}}`}</span>
+                  )}
                 </div>
               ))
             )}
@@ -715,6 +713,7 @@ export default function ChessGraph({
           <div className="board-info">
             <div className="move-line">
               {current.san && <span className="move-name">{current.san}</span>}
+              {formatEval(current) && <span className={`move-eval-inline ${getEvalClass(current)}`}>{formatEval(current)}</span>}
               <span className="side-to-move">{getSideToMove(current.fen)} to move</span>
             </div>
             <div className="stats">
@@ -723,9 +722,6 @@ export default function ChessGraph({
                 <span> • W:{current.win_pct.toFixed(1)}% D:{current.draw_pct.toFixed(1)}% L:{(100 - current.win_pct - current.draw_pct).toFixed(1)}%</span>
               )}
             </div>
-            {formatEval(current) && (
-            <div className="eval">{formatEval(current)}</div>
-          )}
           <WinBar wins={current.wins} draws={current.draws} losses={current.losses} />
         </div>
       </motion.div>
@@ -749,12 +745,12 @@ export default function ChessGraph({
                     <span className="move-san">{move.san}</span>
                     <span className="move-eval">
                       {move.dtm !== undefined ? (
-                        <span className={move.dtm > 0 ? 'eval-win' : move.dtm < 0 ? 'eval-loss' : ''}>
+                        <span className={getEvalClass(move, current.fen)}>
                           M{move.dtm > 0 ? '+' : ''}{move.dtm}
                         </span>
-                      ) : move.cp !== undefined && move.cp !== 0 ? (
-                        <span className={move.cp > 0 ? 'eval-win' : 'eval-loss'}>
-                          {move.cp > 0 ? '+' : ''}{(move.cp / 100).toFixed(2)}
+                      ) : hasValidCP(move.cp) ? (
+                        <span className={getEvalClass(move, current.fen)}>
+                          {move.cp! > 0 ? '+' : ''}{(move.cp! / 100).toFixed(2)}
                         </span>
                       ) : null}
                     </span>
@@ -817,7 +813,9 @@ export default function ChessGraph({
             onNodeClick={handleNodeClick}
             formatStats={formatStats}
             formatEval={formatEval}
+            getEvalClass={getEvalClass}
             boardOrientation={boardOrientation}
+            parentFen={current.fen}
           />
         )}
       </AnimatePresence>
@@ -834,13 +832,15 @@ interface RootChildrenProps {
   children: TreeNode[];
   depth: number;
   topMoves: number;
-  onNodeClick: (node: TreeNode) => void;
+  onNodeClick: (node: TreeNode, ancestors?: TreeNode[]) => void;
   formatStats: (node: TreeNode) => string;
   formatEval: (node: TreeNode) => string | null;
+  getEvalClass: (node: TreeNode, parentFen?: string) => string;
   boardOrientation: BoardOrientation;
+  parentFen: string;
 }
 
-function RootChildren({ children, depth, topMoves, onNodeClick, formatStats, formatEval, boardOrientation }: RootChildrenProps) {
+function RootChildren({ children, depth, topMoves, onNodeClick, formatStats, formatEval, getEvalClass, boardOrientation, parentFen }: RootChildrenProps) {
   const [offset, setOffset] = useState(0);
 
   const totalChildren = children.length;
@@ -886,7 +886,9 @@ function RootChildren({ children, depth, topMoves, onNodeClick, formatStats, for
             onNodeClick={onNodeClick}
             formatStats={formatStats}
             formatEval={formatEval}
+            getEvalClass={getEvalClass}
             boardOrientation={boardOrientation}
+            parentFen={parentFen}
           />
         ))}
         {canPaginate && (
@@ -908,10 +910,12 @@ interface TreeBranchProps {
   onNodeClick: (node: TreeNode, ancestors: TreeNode[]) => void;
   formatStats: (node: TreeNode) => string;
   formatEval: (node: TreeNode) => string | null;
+  getEvalClass: (node: TreeNode, parentFen?: string) => string;
   boardOrientation: BoardOrientation;
+  parentFen: string;
 }
 
-function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onNodeClick, formatStats, formatEval, boardOrientation }: TreeBranchProps) {
+function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onNodeClick, formatStats, formatEval, getEvalClass, boardOrientation, parentFen }: TreeBranchProps) {
   const [offset, setOffset] = useState(0);
 
   const getBoardSize = (lvl: number): number => {
@@ -969,6 +973,7 @@ function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onN
         <div className={`board-info ${level >= 2 ? 'small' : ''}`}>
           <div className="move-line">
             <span className="move-name">{node.san}</span>
+            {formatEval(node) && <span className={`move-eval-inline ${getEvalClass(node, parentFen)}`}>{formatEval(node)}</span>}
             <span className={`side-to-move ${level >= 2 ? 'small' : ''}`}>{getSideToMove(node.fen)} to move</span>
           </div>
           {level < 2 && (
@@ -978,9 +983,6 @@ function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onN
                 <span> • W:{node.win_pct.toFixed(1)}% D:{node.draw_pct.toFixed(1)}% L:{(100 - node.win_pct - node.draw_pct).toFixed(1)}%</span>
               )}
             </div>
-          )}
-          {level < 2 && formatEval(node) && (
-            <div className="eval">{formatEval(node)}</div>
           )}
           <WinBar wins={node.wins} draws={node.draws} losses={node.losses} />
         </div>
@@ -1007,7 +1009,9 @@ function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onN
                 onNodeClick={onNodeClick}
                 formatStats={formatStats}
                 formatEval={formatEval}
+                getEvalClass={getEvalClass}
                 boardOrientation={boardOrientation}
+                parentFen={node.fen}
               />
             ))}
             {canPaginate && (
