@@ -10,6 +10,7 @@ import (
 	"github.com/freeeve/pgn/v2"
 	"github.com/rs/zerolog"
 
+	"github.com/freeeve/chessgraph/api/internal/eco"
 	"github.com/freeeve/chessgraph/api/internal/eval"
 	"github.com/freeeve/chessgraph/api/internal/store"
 )
@@ -18,15 +19,18 @@ import (
 type Handler struct {
 	ps       *store.PositionStore
 	evalPool *eval.TablebasePool
+	ecoDB    *eco.Database
 	log      zerolog.Logger
 }
 
 // NewRouter creates a new HTTP router using the position store.
 // evalPool is optional - if provided, browsed positions will be queued for evaluation.
-func NewRouter(log zerolog.Logger, ps *store.PositionStore, evalPool *eval.TablebasePool) http.Handler {
+// ecoDB is optional - if provided, opening names will be included in responses.
+func NewRouter(log zerolog.Logger, ps *store.PositionStore, evalPool *eval.TablebasePool, ecoDB *eco.Database) http.Handler {
 	h := &Handler{
 		ps:       ps,
 		evalPool: evalPool,
+		ecoDB:    ecoDB,
 		log:      log,
 	}
 
@@ -224,6 +228,8 @@ type TreeNode struct {
 	FEN         string      `json:"fen"`                    // FEN string
 	UCI         string      `json:"uci,omitempty"`          // UCI move that led here
 	SAN         string      `json:"san,omitempty"`          // SAN move that led here
+	ECO         string      `json:"eco,omitempty"`          // ECO opening code
+	Opening     string      `json:"opening,omitempty"`      // Opening name
 	Count       uint32      `json:"count"`                  // Total games
 	Wins        uint32      `json:"wins"`                   // Wins for side to move
 	Draws       uint32      `json:"draws"`                  // Draws
@@ -318,6 +324,14 @@ func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, u
 		FEN:      pos.ToFEN(),
 		UCI:      uci,
 		SAN:      san,
+	}
+
+	// Look up ECO opening
+	if h.ecoDB != nil {
+		if opening := h.ecoDB.Lookup(posKey); opening != nil {
+			node.ECO = opening.ECO
+			node.Opening = opening.Name
+		}
 	}
 
 	// Get position record directly by key

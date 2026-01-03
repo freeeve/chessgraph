@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/freeeve/chessgraph/api/internal/eco"
 	"github.com/freeeve/chessgraph/api/internal/eval"
 	"github.com/freeeve/chessgraph/api/internal/httpapi"
 	"github.com/freeeve/chessgraph/api/internal/ingest"
@@ -82,6 +83,9 @@ func main() {
 		ingestDir    = flag.String("ingest-dir", "", "Directory to watch for PGN files (empty = disabled)")
 		ingestRating = flag.Int("ingest-rating", 2000, "Minimum rating for ingested games")
 
+		// ECO settings
+		ecoDir = flag.String("eco-dir", "./data/eco", "Directory containing ECO .tsv files")
+
 		// Memory settings
 		dirtyLimit = flag.String("dirty-limit", "4g", "Memory limit for dirty blocks (e.g., 512m, 4g)")
 	)
@@ -139,10 +143,22 @@ func main() {
 		}
 	}
 
+	// Load ECO opening database
+	var ecoDB *eco.Database
+	if *ecoDir != "" {
+		ecoDB = eco.NewDatabase()
+		if err := ecoDB.LoadDir(*ecoDir); err != nil {
+			logger.Warn().Err(err).Str("dir", *ecoDir).Msg("failed to load ECO database")
+			ecoDB = nil
+		} else {
+			logger.Info().Int("openings", ecoDB.Count()).Msg("ECO database loaded")
+		}
+	}
+
 	// Start HTTP server
 	srv := &http.Server{
 		Addr:         *addr,
-		Handler:      httpapi.NewRouter(logger, ps, evalPool),
+		Handler:      httpapi.NewRouter(logger, ps, evalPool, ecoDB),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
