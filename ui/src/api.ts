@@ -8,6 +8,9 @@ export interface PathNode {
   san: string;        // SAN move that led here
   eco?: string;       // ECO opening code
   opening?: string;   // Opening name
+  cp?: number;        // Centipawn evaluation
+  dtm?: number;       // Distance to mate
+  has_eval: boolean;  // Whether position has been evaluated
 }
 
 // TreeNode represents a position and its children in the game tree

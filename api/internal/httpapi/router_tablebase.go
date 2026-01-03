@@ -252,6 +252,9 @@ type PathNode struct {
 	SAN      string `json:"san"`               // SAN move that led here
 	ECO      string `json:"eco,omitempty"`     // ECO opening code
 	Opening  string `json:"opening,omitempty"` // Opening name
+	CP       int16  `json:"cp,omitempty"`      // Centipawn evaluation
+	DTM      int16  `json:"dtm,omitempty"`     // Distance to mate
+	HasEval  bool   `json:"has_eval"`          // Whether position has been evaluated
 }
 
 // TreeRequest specifies what to fetch
@@ -271,32 +274,32 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 	var pos *pgn.GameState
 	var pathNodes []*PathNode
 
-	// Check for moves parameter first (preferred method)
+	// Check for moves parameter first (preferred method - SAN notation)
 	movesParam := r.URL.Query().Get("moves")
 	if movesParam != "" {
 		// Parse moves and build path
 		pos = pgn.NewStartingPosition()
 		moves := strings.Split(movesParam, ",")
 
-		for _, uci := range moves {
-			uci = strings.TrimSpace(uci)
-			if uci == "" {
+		for _, san := range moves {
+			san = strings.TrimSpace(san)
+			if san == "" {
 				continue
 			}
 
-			// Parse UCI move
-			mv, err := pgn.ParseUCI(uci)
+			// Parse SAN move (context-dependent, needs current position)
+			mv, err := pgn.ParseSAN(pos, san)
 			if err != nil {
-				http.Error(w, "invalid UCI move: "+uci+": "+err.Error(), http.StatusBadRequest)
+				http.Error(w, "invalid SAN move: "+san+": "+err.Error(), http.StatusBadRequest)
 				return
 			}
 
-			// Get SAN before applying move
-			san := uciToSAN(pos, mv)
+			// Get UCI before applying move
+			uci := mvToUCI(mv)
 
 			// Apply move
 			if err := pgn.ApplyMove(pos, mv); err != nil {
-				http.Error(w, "failed to apply move: "+uci+": "+err.Error(), http.StatusBadRequest)
+				http.Error(w, "failed to apply move: "+san+": "+err.Error(), http.StatusBadRequest)
 				return
 			}
 
@@ -307,6 +310,25 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 				FEN:      pos.ToFEN(),
 				UCI:      uci,
 				SAN:      san,
+			}
+
+			// Look up position data (CP/DTM)
+			if record, err := h.ps.Get(posKey); err == nil && record != nil {
+				if record.HasCP() {
+					pathNode.CP = record.CP
+					pathNode.HasEval = true
+				}
+				if record.DTM != store.DTMUnknown {
+					kind, dist := store.DecodeMate(record.DTM)
+					switch kind {
+					case store.MateWin:
+						pathNode.DTM = dist
+						pathNode.HasEval = true
+					case store.MateLoss:
+						pathNode.DTM = -dist
+						pathNode.HasEval = true
+					}
+				}
 			}
 
 			// Look up ECO
@@ -382,6 +404,31 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 		Msg("tree request completed")
 
 	writeJSON(w, root)
+}
+
+// mvToUCI converts a move to UCI notation
+func mvToUCI(mv pgn.Mv) string {
+	files := "abcdefgh"
+	ranks := "12345678"
+
+	from := string(files[mv.From%8]) + string(ranks[mv.From/8])
+	to := string(files[mv.To%8]) + string(ranks[mv.To/8])
+
+	uci := from + to
+
+	// Add promotion piece
+	switch mv.Promo {
+	case pgn.PromoQueen:
+		uci += "q"
+	case pgn.PromoRook:
+		uci += "r"
+	case pgn.PromoBishop:
+		uci += "b"
+	case pgn.PromoKnight:
+		uci += "n"
+	}
+
+	return uci
 }
 
 // uciToSAN converts a UCI move to SAN notation given the current position

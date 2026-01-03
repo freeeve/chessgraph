@@ -46,12 +46,12 @@ function getBoardOrientation(mode: BoardOrientation, fen: string): 'white' | 'bl
 interface NavigationState {
   current: TreeNode;
   parents: TreeNode[];      // Parent nodes for move history display
-  uciMoves: string[];       // UCI moves from starting position (for URL)
+  sanMoves: string[];       // SAN moves from starting position (for URL)
   lastMoveUci?: string;     // UCI move that led to current position (for highlighting)
 }
 
 interface UrlState {
-  moves: string[];  // UCI moves from starting position
+  moves: string[];  // SAN moves from starting position
   topMoves?: number;
   depth?: number;
 }
@@ -104,8 +104,8 @@ function getStateFromUrl(): UrlState {
   };
 }
 
-// Update URL with current state - moves go in hash as e2e4/e7e5/...
-function updateUrl(uciMoves: string[] = [], topMoves?: number, depth?: number) {
+// Update URL with current state - moves go in hash as e4/e5/Nf3/... (SAN notation)
+function updateUrl(sanMoves: string[] = [], topMoves?: number, depth?: number) {
   const params = new URLSearchParams();
 
   if (topMoves !== undefined) {
@@ -116,7 +116,7 @@ function updateUrl(uciMoves: string[] = [], topMoves?: number, depth?: number) {
   }
 
   const queryString = params.toString();
-  const newHash = uciMoves.length > 0 ? `#${uciMoves.join('/')}` : '';
+  const newHash = sanMoves.length > 0 ? `#${sanMoves.join('/')}` : '';
   const newUrl = queryString
     ? `${window.location.pathname}?${queryString}${newHash}`
     : `${window.location.pathname}${newHash}`;
@@ -167,9 +167,9 @@ export default function ChessGraph({
   const [fenInput, setFenInput] = useState('');
   const [fenError, setFenError] = useState<string | null>(null);
 
-  // Load tree - can use UCI moves (preferred) or position key (fallback for FEN input)
+  // Load tree - can use SAN moves (preferred) or position key (fallback for FEN input)
   const loadTree = useCallback(async (
-    uciMoves: string[],
+    sanMoves: string[],
     updateHistory = true,
     positionKeyOverride?: string  // For FEN input where we don't have moves
   ) => {
@@ -184,10 +184,9 @@ export default function ChessGraph({
       if (positionKeyOverride) {
         // Direct position access (e.g., from FEN input) - no path
         tree = await fetchTree(positionKeyOverride, depth, topMoves, fetchMoves);
-      } else if (uciMoves.length > 0) {
-        // Use moves parameter - single API call returns path
-        tree = await fetchTreeWithMoves(uciMoves, depth, topMoves, fetchMoves);
-        lastMoveUci = uciMoves[uciMoves.length - 1];
+      } else if (sanMoves.length > 0) {
+        // Use moves parameter (SAN) - single API call returns path
+        tree = await fetchTreeWithMoves(sanMoves, depth, topMoves, fetchMoves);
 
         // Build parents from the returned path
         if (tree.path) {
@@ -196,6 +195,9 @@ export default function ChessGraph({
             fen: p.fen,
             uci: p.uci,
             san: p.san,
+            cp: p.cp,
+            dtm: p.dtm,
+            has_eval: p.has_eval,
             count: 0,
             wins: 0,
             draws: 0,
@@ -205,11 +207,14 @@ export default function ChessGraph({
           }));
           // Remove last element - that's the current position, not a parent
           parents.pop();
-          // Set current node's san/uci from path
+          // Set current node's san/uci/cp/dtm from path
           const lastPath = tree.path[tree.path.length - 1];
           if (lastPath) {
             tree.san = lastPath.san;
             tree.uci = lastPath.uci;
+            if (lastPath.cp !== undefined) tree.cp = lastPath.cp;
+            if (lastPath.dtm !== undefined) tree.dtm = lastPath.dtm;
+            lastMoveUci = lastPath.uci; // Get UCI from API for board highlighting
           }
         }
       } else {
@@ -217,9 +222,9 @@ export default function ChessGraph({
         tree = await fetchTree(undefined, depth, topMoves, fetchMoves);
       }
 
-      setNavState({ current: tree, parents, uciMoves, lastMoveUci });
+      setNavState({ current: tree, parents, sanMoves, lastMoveUci });
       if (updateHistory) {
-        updateUrl(uciMoves, topMoves, depth);
+        updateUrl(sanMoves, topMoves, depth);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load position');
@@ -256,23 +261,23 @@ export default function ChessGraph({
 
     if (navState && hasAppliedUrlState && (topMovesChanged || depthChanged)) {
       // Reload with same moves but new parameters
-      loadTree(navState.uciMoves, true);
+      loadTree(navState.sanMoves, true);
     }
   }, [topMoves, depth, prevTopMoves, prevDepth, navState, hasAppliedUrlState, loadTree]);
 
   const handleNodeClick = (node: TreeNode, ancestors: TreeNode[] = []) => {
-    if (navState && node.position !== navState.current.position && node.uci) {
-      // Append UCIs for all ancestors + the clicked node
-      const ancestorUcis = ancestors.map(a => a.uci).filter((u): u is string => !!u);
-      const newMoves = [...navState.uciMoves, ...ancestorUcis, node.uci];
+    if (navState && node.position !== navState.current.position && node.san) {
+      // Append SANs for all ancestors + the clicked node
+      const ancestorSans = ancestors.map(a => a.san).filter((s): s is string => !!s);
+      const newMoves = [...navState.sanMoves, ...ancestorSans, node.san];
       loadTree(newMoves, true);
     }
   };
 
   const handleGoToParent = () => {
-    if (navState && navState.uciMoves.length > 0) {
+    if (navState && navState.sanMoves.length > 0) {
       // Remove last move to go back
-      const newMoves = navState.uciMoves.slice(0, -1);
+      const newMoves = navState.sanMoves.slice(0, -1);
       loadTree(newMoves, true);
     }
   };
@@ -311,11 +316,11 @@ export default function ChessGraph({
       uci += 'q'; // Default to queen promotion
     }
 
-    // Find child with matching UCI move
+    // Find child with matching UCI move, then use its SAN for the URL
     const matchingChild = current.children.find(child => child.uci === uci);
 
-    if (matchingChild && matchingChild.uci) {
-      const newMoves = [...navState.uciMoves, matchingChild.uci];
+    if (matchingChild && matchingChild.san) {
+      const newMoves = [...navState.sanMoves, matchingChild.san];
       loadTree(newMoves, true);
       return true;
     }
@@ -325,8 +330,8 @@ export default function ChessGraph({
       for (const promo of ['r', 'b', 'n']) {
         const promoUci = sourceSquare + targetSquare + promo;
         const promoChild = current.children.find(child => child.uci === promoUci);
-        if (promoChild && promoChild.uci) {
-          const newMoves = [...navState.uciMoves, promoChild.uci];
+        if (promoChild && promoChild.san) {
+          const newMoves = [...navState.sanMoves, promoChild.san];
           loadTree(newMoves, true);
           return true;
         }
@@ -645,7 +650,7 @@ export default function ChessGraph({
             <button
               className="back-btn"
               onClick={handleGoToParent}
-              disabled={navState.uciMoves.length === 0}
+              disabled={navState.sanMoves.length === 0}
               title="Go back"
             >
               ←
@@ -663,8 +668,8 @@ export default function ChessGraph({
                     className="white-move clickable"
                     onClick={() => {
                       // Navigate to this position using the first N moves
-                      const moveIndex = idx * 2 + 1; // +1 because uciMoves[0] leads to move 1
-                      const newMoves = navState.uciMoves.slice(0, moveIndex);
+                      const moveIndex = idx * 2 + 1; // +1 because sanMoves[0] leads to move 1
+                      const newMoves = navState.sanMoves.slice(0, moveIndex);
                       loadTree(newMoves, true);
                     }}
                   >
@@ -679,7 +684,7 @@ export default function ChessGraph({
                       if (!move.black) return;
                       // Navigate to this position using the first N moves
                       const moveIndex = idx * 2 + 2; // +2 for black's move
-                      const newMoves = navState.uciMoves.slice(0, moveIndex);
+                      const newMoves = navState.sanMoves.slice(0, moveIndex);
                       loadTree(newMoves, true);
                     }}
                   >
