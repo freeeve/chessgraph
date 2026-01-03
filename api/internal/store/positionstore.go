@@ -702,14 +702,23 @@ func (ps *PositionStore) Put(pos graph.PositionKey, record *PositionRecord) erro
 		ps.dirtyBytes += int64(len(filename)) + 50 // map entry overhead
 	}
 
-	// Check if key already exists (O(1) lookup)
-	if _, exists := keyMap[blockKey]; !exists {
+	// Check if key already exists - if so, merge to preserve counts from Increment
+	existing, exists := keyMap[blockKey]
+	if !exists {
 		// New entry: track memory
 		ps.dirtyBytes += BlockRecordSize
+		keyMap[blockKey] = *record
+	} else {
+		// Merge: keep existing counts (from Increment), only update eval fields
+		// This prevents race where eval worker reads stale counts from disk
+		// while Increment has already added to dirty counts
+		merged := existing
+		merged.CP = record.CP
+		merged.DTM = record.DTM
+		merged.DTZ = record.DTZ
+		merged.ProvenDepth = record.ProvenDepth
+		keyMap[blockKey] = merged
 	}
-
-	// Store/update the record
-	keyMap[blockKey] = *record
 	ps.totalWrites++
 
 	return nil
@@ -769,89 +778,6 @@ func (ps *PositionStore) Increment(pos graph.PositionKey, wins, draws, losses ui
 	}
 
 	keyMap[blockKey] = rec
-	ps.totalWrites++
-
-	return nil
-}
-
-// GetV7 retrieves a position record using V7 pack file format
-func (ps *PositionStore) GetV7(pos graph.PositionKey) (*PositionRecord, error) {
-	prefix := ExtractPrefix(pos)
-	packKey := ExtractBlockKey(pos)
-	filename := prefix.BlockFileName()
-
-	// Check dirty buffer first (O(1) map lookup), then inflight
-	ps.dirtyMu.Lock()
-	if keyMap, ok := ps.dirtyBlocks[filename]; ok {
-		if rec, found := keyMap[packKey]; found {
-			ps.dirtyMu.Unlock()
-			r := rec // copy
-			return &r, nil
-		}
-	}
-	// Check inflight records (being flushed to disk) - still linear but small
-	if records, ok := ps.inflightBlocks[filename]; ok {
-		for i := range records {
-			if records[i].Key == packKey {
-				ps.dirtyMu.Unlock()
-				r := records[i].Data // copy
-				return &r, nil
-			}
-		}
-	}
-	ps.dirtyMu.Unlock()
-
-	// Load pack file
-	pack, err := ps.getBlockFile(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrPSKeyNotFound
-		}
-		return nil, err
-	}
-
-	// Binary search for key
-	idx := sort.Search(len(pack.records), func(i int) bool {
-		return bytes.Compare(pack.records[i].Key[:], packKey[:]) >= 0
-	})
-
-	if idx < len(pack.records) && pack.records[idx].Key == packKey {
-		r := pack.records[idx].Data // copy
-		return &r, nil
-	}
-
-	return nil, ErrPSKeyNotFound
-}
-
-// PutV7 stores or updates a position record using V7 pack file format
-func (ps *PositionStore) PutV7(pos graph.PositionKey, record *PositionRecord) error {
-	if ps.readOnly {
-		return ErrPSReadOnly
-	}
-
-	prefix := ExtractPrefix(pos)
-	packKey := ExtractBlockKey(pos)
-	filename := prefix.BlockFileName()
-
-	ps.dirtyMu.Lock()
-	defer ps.dirtyMu.Unlock()
-
-	// Get or create the inner map for this filename
-	keyMap := ps.dirtyBlocks[filename]
-	if keyMap == nil {
-		keyMap = make(map[BlockKey]PositionRecord)
-		ps.dirtyBlocks[filename] = keyMap
-		ps.dirtyBytes += int64(len(filename)) + 50 // map entry overhead
-	}
-
-	// Check if key already exists (O(1) lookup)
-	if _, exists := keyMap[packKey]; !exists {
-		// New entry: track memory
-		ps.dirtyBytes += BlockRecordSize
-	}
-
-	// Store/update the record
-	keyMap[packKey] = *record
 	ps.totalWrites++
 
 	return nil
