@@ -119,6 +119,16 @@ func (s *RefutationScanner) Run(ctx context.Context) error {
 
 		enqueued := s.scanDepthLevel(ctx, currentDepth)
 
+		if enqueued < 0 {
+			// No data in database yet, wait before retrying
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(10 * time.Second):
+				continue // Retry same depth
+			}
+		}
+
 		if enqueued > 0 {
 			// Wait for refutation queue to drain before scanning more
 			s.waitForQueueDrain(ctx)
@@ -152,7 +162,7 @@ func (s *RefutationScanner) scanDepthLevel(ctx context.Context, targetDepth int)
 
 	if _, err := s.ps.Get(startPacked); err != nil {
 		s.log.Debug().Msg("root position not in database for refutation scan")
-		return 0
+		return -1 // Signal to caller to wait
 	}
 
 	queue = append(queue, bfsItem{packed: startPacked, depth: 0})
