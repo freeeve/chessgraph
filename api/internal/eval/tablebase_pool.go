@@ -57,7 +57,6 @@ type TablebasePool struct {
 	maxWorkers    int32 // configured maximum workers
 
 	// Stats
-	expanded         int64
 	evaluated        int64
 	browseEvaled     int64 // Positions evaluated from browse queue
 	refutationEvaled int64 // Positions evaluated from refutation queue
@@ -222,14 +221,14 @@ func (p *TablebasePool) Run(ctx context.Context) error {
 	}
 
 	p.log.Info().
-		Int64("total_expanded", atomic.LoadInt64(&p.expanded)).
 		Int64("total_evaluated", atomic.LoadInt64(&p.evaluated)).
 		Msg("tablebase pool stopped")
 
 	return ctx.Err()
 }
 
-// runEnumerator does DFS enumeration and sends positions needing eval to the work queue.
+// runEnumerator does BFS through positions that exist in the database.
+// Only evaluates positions that were ingested from actual games.
 func (p *TablebasePool) runEnumerator(ctx context.Context) {
 	defer close(p.workQueue)
 
@@ -242,44 +241,21 @@ func (p *TablebasePool) runEnumerator(ctx context.Context) {
 		default:
 		}
 
-		foundWork := false
-
-		// Process depth-by-depth
-		for depth := 0; depth <= p.cfg.MaxDepth; depth++ {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			atomic.StoreInt32(&p.currentDepth, int32(depth))
-
-			// First expand, then enumerate for eval
-			expanded := p.expandDepth(ctx, depth)
-			if expanded > 0 {
-				foundWork = true
-			}
-
-			queued := p.enumerateForEval(ctx, depth)
-			if queued > 0 {
-				foundWork = true
-				// Wait for queue to drain before moving to next depth
-				p.waitForQueueDrain(ctx)
-			}
-		}
+		// BFS through existing positions in the database
+		queued := p.enumerateExistingPositions(ctx)
 
 		// Log progress
-		if time.Since(lastLog) > 30*time.Second {
+		if time.Since(lastLog) > 30*time.Second || queued > 0 {
 			p.log.Info().
-				Int64("expanded", atomic.LoadInt64(&p.expanded)).
 				Int64("evaluated", atomic.LoadInt64(&p.evaluated)).
 				Int32("current_depth", atomic.LoadInt32(&p.currentDepth)).
+				Int64("queued_this_pass", queued).
 				Msg("pool progress")
 			lastLog = time.Now()
 		}
 
-		if !foundWork {
-			p.log.Info().Msg("all depths complete, sleeping")
+		if queued == 0 {
+			p.log.Info().Msg("no unevaluated positions found, sleeping")
 			select {
 			case <-ctx.Done():
 				return
@@ -289,107 +265,120 @@ func (p *TablebasePool) runEnumerator(ctx context.Context) {
 	}
 }
 
-// expandDepth expands positions at a specific depth (creates empty records).
-func (p *TablebasePool) expandDepth(ctx context.Context, targetDepth int) int64 {
-	var expanded int64
+// enumerateExistingPositions does BFS through positions that exist in the database.
+// Only queues positions that need evaluation (no CP and no DTM).
+// Returns the number of positions queued.
+func (p *TablebasePool) enumerateExistingPositions(ctx context.Context) int64 {
+	var queued int64
 
-	if targetDepth == 0 {
-		pos := pgn.NewStartingPosition()
-		packed := pos.Pack()
-		_, err := p.ps.Get(packed)
-		if err == store.ErrPSKeyNotFound {
-			if err := p.ps.Put(packed, &store.PositionRecord{}); err == nil {
-				expanded++
-				atomic.AddInt64(&p.expanded, 1)
-			}
-		}
-		return expanded
+	// Use a map to track visited positions (avoid cycles from transpositions)
+	visited := make(map[string]bool)
+
+	// BFS queue: positions to explore
+	type bfsItem struct {
+		packed pgn.PackedPosition
+		depth  int
+	}
+	queue := make([]bfsItem, 0, 10000)
+
+	// Start with root position
+	startPos := pgn.NewStartingPosition()
+	startPacked := startPos.Pack()
+
+	// Only start if root exists in database
+	if _, err := p.ps.Get(startPacked); err != nil {
+		p.log.Warn().Msg("root position not in database")
+		return 0
 	}
 
-	enum := pgn.NewPositionEnumeratorDFS(pgn.NewStartingPosition())
-	enum.EnumerateDFS(targetDepth, func(index uint64, pos *pgn.GameState, depth int) bool {
+	queue = append(queue, bfsItem{packed: startPacked, depth: 0})
+	visited[startPacked.String()] = true
+
+	for len(queue) > 0 {
 		select {
 		case <-ctx.Done():
-			return false
+			return queued
 		default:
 		}
 
-		if depth != targetDepth {
-			return true
+		// Pop front of queue
+		item := queue[0]
+		queue = queue[1:]
+
+		atomic.StoreInt32(&p.currentDepth, int32(item.depth))
+
+		// Check if this position needs evaluation
+		record, err := p.ps.Get(item.packed)
+		if err != nil || record == nil {
+			continue
 		}
 
-		packed := pos.Pack()
-		_, err := p.ps.Get(packed)
-		if err == store.ErrPSKeyNotFound {
-			if err := p.ps.Put(packed, &store.PositionRecord{}); err == nil {
-				expanded++
-				atomic.AddInt64(&p.expanded, 1)
-			}
-		}
-		return true
-	})
-
-	if expanded > 0 {
-		p.ps.FlushAll()
-		p.log.Info().Int("depth", targetDepth).Int64("expanded", expanded).Msg("expansion complete")
-	}
-
-	return expanded
-}
-
-// enumerateForEval finds positions needing eval and sends them to the work queue.
-func (p *TablebasePool) enumerateForEval(ctx context.Context, targetDepth int) int64 {
-	var queued int64
-
-	if targetDepth == 0 {
-		pos := pgn.NewStartingPosition()
-		packed := pos.Pack()
-		record, err := p.ps.Get(packed)
-		// Need eval if CP is unknown AND no DTM
-		needsEval := err == nil && record != nil && !record.HasCP() && record.DTM == store.DTMUnknown
-		if needsEval {
+		// Queue for eval if needed (no CP and no DTM)
+		if !record.HasCP() && record.DTM == store.DTMUnknown {
 			select {
-			case p.workQueue <- packed:
+			case p.workQueue <- item.packed:
 				queued++
 			case <-ctx.Done():
 				return queued
 			}
 		}
-		return queued
+
+		// Don't explore beyond max depth
+		if item.depth >= p.cfg.MaxDepth {
+			continue
+		}
+
+		// Unpack and generate legal moves to find children
+		pos := item.packed.Unpack()
+		if pos == nil {
+			continue
+		}
+
+		moves := pgn.GenerateLegalMoves(pos)
+		for _, mv := range moves {
+			// Make a copy and apply move
+			childPos := item.packed.Unpack()
+			if childPos == nil {
+				continue
+			}
+			if err := pgn.ApplyMove(childPos, mv); err != nil {
+				continue
+			}
+
+			childPacked := childPos.Pack()
+			childKey := childPacked.String()
+
+			// Skip if already visited
+			if visited[childKey] {
+				continue
+			}
+
+			// Only explore if child exists in database (was seen in actual games)
+			if _, err := p.ps.Get(childPacked); err != nil {
+				continue
+			}
+
+			visited[childKey] = true
+			queue = append(queue, bfsItem{packed: childPacked, depth: item.depth + 1})
+		}
+
+		// Log progress periodically
+		if queued > 0 && queued%10000 == 0 {
+			p.log.Info().
+				Int64("queued", queued).
+				Int("queue_size", len(queue)).
+				Int("visited", len(visited)).
+				Int("depth", item.depth).
+				Msg("BFS progress")
+		}
 	}
 
-	enum := pgn.NewPositionEnumeratorDFS(pgn.NewStartingPosition())
-	enum.EnumerateDFS(targetDepth, func(index uint64, pos *pgn.GameState, depth int) bool {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
-
-		if depth != targetDepth {
-			return true
-		}
-
-		packed := pos.Pack()
-		record, err := p.ps.Get(packed)
-		if err != nil || record == nil {
-			return true
-		}
-
-		// Need eval if CP is unknown AND no DTM
-		if !record.HasCP() && record.DTM == store.DTMUnknown {
-			select {
-			case p.workQueue <- packed:
-				queued++
-			case <-ctx.Done():
-				return false
-			}
-		}
-		return true
-	})
-
 	if queued > 0 {
-		p.log.Info().Int("depth", targetDepth).Int64("queued", queued).Msg("queued positions for eval")
+		p.log.Info().
+			Int64("queued", queued).
+			Int("visited", len(visited)).
+			Msg("BFS complete, waiting for queue to drain")
+		p.waitForQueueDrain(ctx)
 	}
 
 	return queued
@@ -903,26 +892,24 @@ func (p *TablebasePool) provePositionDFS(ctx context.Context, engine *uci.Engine
 
 // PoolStats holds comprehensive pool statistics.
 type PoolStats struct {
-	Expanded         int64
-	Evaluated        int64
-	BrowseEvaled     int64
-	RefutationEvaled int64
-	MatesProved      int64
-	CurrentDepth     int32
-	BrowseQueueLen   int
+	Evaluated          int64
+	BrowseEvaled       int64
+	RefutationEvaled   int64
+	MatesProved        int64
+	CurrentDepth       int32
+	BrowseQueueLen     int
 	RefutationQueueLen int
 }
 
 // Stats returns current pool statistics.
 func (p *TablebasePool) Stats() PoolStats {
 	return PoolStats{
-		Expanded:         atomic.LoadInt64(&p.expanded),
-		Evaluated:        atomic.LoadInt64(&p.evaluated),
-		BrowseEvaled:     atomic.LoadInt64(&p.browseEvaled),
-		RefutationEvaled: atomic.LoadInt64(&p.refutationEvaled),
-		MatesProved:      atomic.LoadInt64(&p.matesProved),
-		CurrentDepth:     atomic.LoadInt32(&p.currentDepth),
-		BrowseQueueLen:   p.browseQueue.Len(),
+		Evaluated:          atomic.LoadInt64(&p.evaluated),
+		BrowseEvaled:       atomic.LoadInt64(&p.browseEvaled),
+		RefutationEvaled:   atomic.LoadInt64(&p.refutationEvaled),
+		MatesProved:        atomic.LoadInt64(&p.matesProved),
+		CurrentDepth:       atomic.LoadInt32(&p.currentDepth),
+		BrowseQueueLen:     p.browseQueue.Len(),
 		RefutationQueueLen: len(p.refutationQueue),
 	}
 }

@@ -130,19 +130,40 @@ func (s *RefutationScanner) Run(ctx context.Context) error {
 }
 
 // scanDepthLevel scans positions at a specific depth for extreme evals.
+// Uses BFS through positions that exist in the database.
 func (s *RefutationScanner) scanDepthLevel(ctx context.Context, targetDepth int) int {
 	var enqueued int
 	scannedAtDepth := int64(0)
 	lastLog := time.Now()
 
-	enum := pgn.NewPositionEnumeratorDFS(pgn.NewStartingPosition())
+	// Track visited positions
+	visited := make(map[string]bool)
 
-	s.log.Debug().Int("target_depth", targetDepth).Msg("starting DFS enumeration")
+	// BFS queue
+	type bfsItem struct {
+		packed pgn.PackedPosition
+		depth  int
+	}
+	queue := make([]bfsItem, 0, 10000)
 
-	enum.EnumerateDFS(targetDepth, func(index uint64, pos *pgn.GameState, depth int) bool {
+	// Start from root
+	startPos := pgn.NewStartingPosition()
+	startPacked := startPos.Pack()
+
+	if _, err := s.ps.Get(startPacked); err != nil {
+		s.log.Debug().Msg("root position not in database for refutation scan")
+		return 0
+	}
+
+	queue = append(queue, bfsItem{packed: startPacked, depth: 0})
+	visited[startPacked.String()] = true
+
+	s.log.Debug().Int("target_depth", targetDepth).Msg("starting BFS scan for extreme positions")
+
+	for len(queue) > 0 {
 		select {
 		case <-ctx.Done():
-			return false
+			return enqueued
 		default:
 		}
 
@@ -150,64 +171,102 @@ func (s *RefutationScanner) scanDepthLevel(ctx context.Context, targetDepth int)
 		for s.IsPaused() {
 			select {
 			case <-ctx.Done():
-				return false
+				return enqueued
 			case <-time.After(500 * time.Millisecond):
 				// Check again
 			}
 		}
 
-		// Only process positions at exactly the target depth
-		if depth != targetDepth {
-			return true
-		}
+		// Pop front
+		item := queue[0]
+		queue = queue[1:]
 
-		scannedAtDepth++
-		atomic.AddInt64(&s.positionsScanned, 1)
+		// Only check positions at target depth for extreme evals
+		if item.depth == targetDepth {
+			scannedAtDepth++
+			atomic.AddInt64(&s.positionsScanned, 1)
 
-		// Log progress
-		if time.Since(lastLog) > 10*time.Second {
-			s.log.Info().
-				Int("depth", targetDepth).
-				Int64("scanned", scannedAtDepth).
-				Int("enqueued", enqueued).
-				Msg("scanning...")
-			lastLog = time.Now()
-		}
+			// Log progress
+			if time.Since(lastLog) > 10*time.Second {
+				s.log.Info().
+					Int("depth", targetDepth).
+					Int64("scanned", scannedAtDepth).
+					Int("enqueued", enqueued).
+					Int("queue_size", len(queue)).
+					Msg("scanning...")
+				lastLog = time.Now()
+			}
 
-		packed := pos.Pack()
-		record, err := s.ps.Get(packed)
-		if err != nil || record == nil {
-			return true
-		}
-
-		// Check if extreme and not yet proven
-		if record.DTM == store.DTMUnknown {
-			if record.CP <= s.cfg.BadThreshold {
-				atomic.AddInt64(&s.extremeFound, 1)
-				if s.pool.EnqueueRefutation(RefutationJob{
-					Position: packed,
-					CP:       record.CP,
-					Winning:  false,
-				}) {
-					enqueued++
-				}
-			} else if record.CP >= s.cfg.GoodThreshold {
-				atomic.AddInt64(&s.extremeFound, 1)
-				if s.pool.EnqueueRefutation(RefutationJob{
-					Position: packed,
-					CP:       record.CP,
-					Winning:  true,
-				}) {
-					enqueued++
+			record, err := s.ps.Get(item.packed)
+			if err == nil && record != nil && record.HasCP() && record.DTM == store.DTMUnknown {
+				// Check if extreme
+				if record.CP <= s.cfg.BadThreshold {
+					atomic.AddInt64(&s.extremeFound, 1)
+					if s.pool.EnqueueRefutation(RefutationJob{
+						Position: item.packed,
+						CP:       record.CP,
+						Winning:  false,
+					}) {
+						enqueued++
+					}
+				} else if record.CP >= s.cfg.GoodThreshold {
+					atomic.AddInt64(&s.extremeFound, 1)
+					if s.pool.EnqueueRefutation(RefutationJob{
+						Position: item.packed,
+						CP:       record.CP,
+						Winning:  true,
+					}) {
+						enqueued++
+					}
 				}
 			}
+
+			// Stop when batch is full
+			if enqueued >= s.cfg.BatchSize {
+				break
+			}
+			continue // Don't explore beyond target depth
 		}
 
-		// Stop when batch is full
-		return enqueued < s.cfg.BatchSize
-	})
+		// Only explore children if we haven't reached target depth
+		if item.depth >= targetDepth {
+			continue
+		}
 
-	s.log.Debug().Int("target_depth", targetDepth).Int64("scanned", scannedAtDepth).Msg("DFS enumeration completed")
+		// Generate legal moves to find children
+		pos := item.packed.Unpack()
+		if pos == nil {
+			continue
+		}
+
+		moves := pgn.GenerateLegalMoves(pos)
+		for _, mv := range moves {
+			childPos := item.packed.Unpack()
+			if childPos == nil {
+				continue
+			}
+			if err := pgn.ApplyMove(childPos, mv); err != nil {
+				continue
+			}
+
+			childPacked := childPos.Pack()
+			childKey := childPacked.String()
+
+			if visited[childKey] {
+				continue
+			}
+
+			// Only explore if child exists in database
+			if _, err := s.ps.Get(childPacked); err != nil {
+				continue
+			}
+
+			visited[childKey] = true
+			queue = append(queue, bfsItem{packed: childPacked, depth: item.depth + 1})
+		}
+	}
+
+	s.log.Debug().Int("target_depth", targetDepth).Int64("scanned", scannedAtDepth).Msg("BFS scan completed")
 
 	if enqueued > 0 {
 		s.log.Info().
