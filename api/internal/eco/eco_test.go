@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/freeeve/chessgraph/api/internal/eco"
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 )
 
 func TestLoadAndLookup(t *testing.T) {

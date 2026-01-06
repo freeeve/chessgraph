@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -8,8 +9,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/freeeve/pgn/v2"
-
+	"github.com/freeeve/chessgraph/api/internal/graph"
 	"github.com/freeeve/chessgraph/api/internal/store"
 )
 
@@ -49,15 +49,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Validate header
-	if len(header) < 4 || header[0] != "fen" || header[1] != "cp" || header[2] != "dtm" || header[3] != "dtz" {
-		fmt.Fprintf(os.Stderr, "invalid header: expected [fen,cp,dtm,dtz], got %v\n", header)
+	// Detect format:
+	// - New format: fen,position,cp,dtm,dtz,proven_depth (6 columns)
+	// - Old format: position,cp,dtm,dtz,proven_depth (5 columns)
+	var positionCol int
+	if len(header) >= 6 && header[0] == "fen" && header[1] == "position" {
+		positionCol = 1
+		fmt.Println("Detected new format (fen,position,...)")
+	} else if len(header) >= 5 && header[0] == "position" {
+		positionCol = 0
+		fmt.Println("Detected old format (position,...)")
+	} else {
+		fmt.Fprintf(os.Stderr, "invalid header: expected [fen,position,cp,dtm,dtz,proven_depth] or [position,cp,dtm,dtz,proven_depth], got %v\n", header)
 		os.Exit(1)
 	}
 
 	var imported, skipped, created, errors uint64
 
 	fmt.Printf("Importing evals from %s...\n", *inputPath)
+
+	// Column offsets depend on format
+	cpCol := positionCol + 1
+	dtmCol := positionCol + 2
+	dtzCol := positionCol + 3
+	provenDepthCol := positionCol + 4
+	minCols := positionCol + 5
 
 	for {
 		row, err := reader.Read()
@@ -70,25 +86,46 @@ func main() {
 			continue
 		}
 
-		if len(row) < 4 {
+		if len(row) < minCols {
 			errors++
 			continue
 		}
 
-		fen := row[0]
-		cp, _ := strconv.Atoi(row[1])
-		dtm, _ := strconv.Atoi(row[2])
-		dtz, _ := strconv.Atoi(row[3])
-
-		// Parse FEN to get packed position
-		pos, err := pgn.NewGame(fen)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "parse FEN %q: %v\n", fen, err)
+		// Parse position key from base64 (try multiple encodings)
+		var packed graph.PositionKey
+		var keyBytes []byte
+		var decodeErr error
+		posStr := row[positionCol]
+		// Try RawURLEncoding first (URL-safe, no padding)
+		keyBytes, decodeErr = base64.RawURLEncoding.DecodeString(posStr)
+		if decodeErr != nil {
+			// Try URLEncoding (URL-safe, with padding)
+			keyBytes, decodeErr = base64.URLEncoding.DecodeString(posStr)
+		}
+		if decodeErr != nil {
+			// Try RawStdEncoding (standard, no padding)
+			keyBytes, decodeErr = base64.RawStdEncoding.DecodeString(posStr)
+		}
+		if decodeErr != nil {
+			// Try StdEncoding (standard, with padding)
+			keyBytes, decodeErr = base64.StdEncoding.DecodeString(posStr)
+		}
+		if decodeErr != nil {
+			fmt.Fprintf(os.Stderr, "decode position key %q: %v\n", posStr, decodeErr)
 			errors++
 			continue
 		}
+		if len(keyBytes) != 26 {
+			fmt.Fprintf(os.Stderr, "invalid position key length: expected 26, got %d bytes\n", len(keyBytes))
+			errors++
+			continue
+		}
+		copy(packed[:], keyBytes)
 
-		packed := pos.Pack()
+		cp, _ := strconv.Atoi(row[cpCol])
+		dtm, _ := strconv.Atoi(row[dtmCol])
+		dtz, _ := strconv.Atoi(row[dtzCol])
+		provenDepth, _ := strconv.Atoi(row[provenDepthCol])
 
 		// Get existing record or create new one
 		rec, err := ps.Get(packed)
@@ -108,6 +145,7 @@ func main() {
 		newCP := int16(cp)
 		newDTM := int16(dtm)
 		newDTZ := uint16(dtz)
+		newProvenDepth := uint16(provenDepth)
 
 		// Skip if record already has identical eval data
 		if !isNew && rec.HasCP() && rec.CP == newCP && rec.DTM == newDTM && rec.DTZ == newDTZ {
@@ -117,6 +155,7 @@ func main() {
 
 		// Update eval fields from import
 		rec.CP = newCP
+		rec.ProvenDepth = newProvenDepth
 		rec.SetHasCP(true)
 		rec.DTM = newDTM
 		rec.DTZ = newDTZ
@@ -130,7 +169,7 @@ func main() {
 
 		imported++
 
-		if imported%1000 == 0 {
+		if imported%10000 == 0 {
 			fmt.Printf("Imported %d evals (skipped %d, created %d, errors %d)\n",
 				imported, skipped, created, errors)
 		}

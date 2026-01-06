@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 	"github.com/freeeve/uci"
 	"github.com/rs/zerolog"
 
@@ -31,7 +31,7 @@ type TablebaseWorker struct {
 	engine *uci.Engine
 	log    zerolog.Logger
 	cfg    TablebaseWorkerConfig
-	ps     *store.PositionStore
+	ps     store.WriteStore
 
 	// Stats
 	expanded         int64 // Positions created during expansion
@@ -42,7 +42,7 @@ type TablebaseWorker struct {
 }
 
 // NewTablebaseWorker creates a new tablebase evaluation worker.
-func NewTablebaseWorker(cfg TablebaseWorkerConfig, ps *store.PositionStore) (*TablebaseWorker, error) {
+func NewTablebaseWorker(cfg TablebaseWorkerConfig, ps store.WriteStore) (*TablebaseWorker, error) {
 	if cfg.StockfishPath == "" {
 		return nil, fmt.Errorf("stockfish path required")
 	}
@@ -233,9 +233,7 @@ func (w *TablebaseWorker) expandDepthLevel(ctx context.Context, targetDepth int)
 		atomic.StoreInt64(&w.positionsAtDepth, processed)
 
 		if expanded > 0 {
-			if err := w.ps.FlushAll(); err != nil {
-				return true, fmt.Errorf("flush position store: %w", err)
-			}
+			w.ps.FlushAllAsync()
 			return true, nil
 		}
 		return false, nil
@@ -298,9 +296,7 @@ func (w *TablebaseWorker) expandDepthLevel(ctx context.Context, targetDepth int)
 			Msg("expansion complete at depth")
 
 		// Flush after expansion
-		if err := w.ps.FlushAll(); err != nil {
-			return true, fmt.Errorf("flush position store: %w", err)
-		}
+		w.ps.FlushAllAsync()
 		return true, nil
 	}
 
@@ -418,9 +414,7 @@ func (w *TablebaseWorker) evaluateDepthLevel(ctx context.Context, targetDepth in
 	}
 
 	// Flush after batch
-	if err := w.ps.FlushAll(); err != nil {
-		return true, fmt.Errorf("flush position store: %w", err)
-	}
+	w.ps.FlushAllAsync()
 
 	return true, nil
 }
@@ -641,9 +635,7 @@ func (w *TablebaseWorker) propagateDTM(ctx context.Context) (int, error) {
 	}
 
 	// Flush after propagation
-	if err := w.ps.FlushAll(); err != nil {
-		return updated, err
-	}
+	w.ps.FlushAllAsync()
 
 	return updated, nil
 }

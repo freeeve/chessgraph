@@ -65,9 +65,6 @@ func main() {
 		evalWorker   = flag.Bool("eval", true, "enable position eval worker")
 		refuteWorker = flag.Bool("refute", true, "enable refutation worker (proves mates)")
 
-		// Position store
-		cachedBlocks = flag.Int("cached-blocks", 32, "number of position store blocks to cache")
-
 		// Eval settings
 		evalDepth     = flag.Int("eval-depth", 30, "Stockfish evaluation depth")
 		refuteDepth   = flag.Int("refute-depth", 30, "Stockfish depth for refutation proving")
@@ -100,27 +97,34 @@ func main() {
 
 	logger := logx.NewLogger()
 
-	// Open position store
-	ps, err := store.NewPositionStore(*positionStoreDir, *cachedBlocks)
+	// Open V12 position store
+	v12, err := store.NewV12Store(store.V12StoreConfig{
+		Dir: *positionStoreDir,
+		// MemtableSize defaults to 512MB, NumWorkers defaults to runtime.NumCPU()
+	})
 	if err != nil {
-		logger.Fatal().Err(err).Msg("open position store")
+		logger.Fatal().Err(err).Msg("open v12 store")
 	}
-	defer ps.Close()
-
-	// Set up position store logging
-	ps.SetLogger(func(format string, args ...any) {
+	v12.SetLogger(func(format string, args ...any) {
 		logger.Info().Msgf(format, args...)
 	})
+	defer v12.Close()
+
+	// Interface variables for components
+	var readStore store.ReadStore = v12
+	var writeStore store.WriteStore = v12
+	var ingestStore store.IngestStore = v12
+
+	logger.Info().Str("dir", *positionStoreDir).Msg("opened V12 store")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// Log position store stats
-	stats := ps.Stats()
+	stats := readStore.Stats()
 	logger.Info().
 		Uint64("reads", stats.TotalReads).
 		Uint64("writes", stats.TotalWrites).
-		Int("cached_blocks", stats.CachedBlocks).
 		Msg("position store loaded")
 
 	// Create position eval pool (before HTTP server so we can pass it to the router)
@@ -141,7 +145,7 @@ func main() {
 			MaxDepth:        20,
 			RefutationOnly:  !*evalWorker, // Skip DFS if only doing refutation
 			DirtyMemLimit:   dirtyMemLimit,
-		}, ps)
+		}, writeStore)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("create eval pool")
 		}
@@ -162,7 +166,7 @@ func main() {
 	// Start HTTP server
 	srv := &http.Server{
 		Addr:         *addr,
-		Handler:      httpapi.NewRouter(logger, ps, evalPool, ecoDB),
+		Handler:      httpapi.NewRouter(logger, readStore, evalPool, ecoDB),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -183,7 +187,7 @@ func main() {
 			BadThreshold:  int16(*badThreshold),
 			GoodThreshold: int16(*goodThreshold),
 			BatchSize:     50,
-		}, ps, evalPool)
+		}, readStore, evalPool)
 	}
 
 	// Start ingest worker if configured
@@ -191,15 +195,18 @@ func main() {
 		cfg := ingest.Config{
 			WatchDir:      *ingestDir,
 			RatingMin:     *ingestRating,
-			FlushEvery:    1000,
 			DirtyMemLimit: dirtyMemLimit,
 			Logger:        logger.With().Str("component", "ingest").Logger(),
+			// CheckFlushEvery defaults to 100 games
 		}
-		// Pause scanner during ingest to reduce contention
+		// Pause eval pool and scanner during ingest to reduce contention
+		if evalPool != nil {
+			cfg.PauseDuring = append(cfg.PauseDuring, evalPool)
+		}
 		if scanner != nil {
-			cfg.PauseDuring = []ingest.Pausable{scanner}
+			cfg.PauseDuring = append(cfg.PauseDuring, scanner)
 		}
-		worker, err := ingest.NewWorker(cfg, ps)
+		worker, err := ingest.NewWorker(cfg, ingestStore)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("create ingest worker")
 		}
@@ -256,10 +263,10 @@ func main() {
 
 	// Flush position store to ensure all dirty blocks are written
 	logger.Info().Msg("flushing position store...")
-	if err := ps.FlushAll(); err != nil {
+	if err := writeStore.FlushAll(); err != nil {
 		logger.Error().Err(err).Msg("position store flush error")
 	} else {
-		stats := ps.Stats()
+		stats := readStore.Stats()
 		logger.Info().
 			Uint64("reads", stats.TotalReads).
 			Uint64("writes", stats.TotalWrites).

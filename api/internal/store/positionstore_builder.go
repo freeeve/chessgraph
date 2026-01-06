@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 
 	"github.com/freeeve/chessgraph/api/internal/graph"
 )

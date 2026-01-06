@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/pprof"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 	"github.com/rs/zerolog"
 
 	"github.com/freeeve/chessgraph/api/internal/eco"
@@ -17,7 +19,7 @@ import (
 
 // Handler uses the position store.
 type Handler struct {
-	ps       *store.PositionStore
+	ps       store.ReadStore
 	evalPool *eval.TablebasePool
 	ecoDB    *eco.Database
 	log      zerolog.Logger
@@ -26,7 +28,7 @@ type Handler struct {
 // NewRouter creates a new HTTP router using the position store.
 // evalPool is optional - if provided, browsed positions will be queued for evaluation.
 // ecoDB is optional - if provided, opening names will be included in responses.
-func NewRouter(log zerolog.Logger, ps *store.PositionStore, evalPool *eval.TablebasePool, ecoDB *eco.Database) http.Handler {
+func NewRouter(log zerolog.Logger, ps store.ReadStore, evalPool *eval.TablebasePool, ecoDB *eco.Database) http.Handler {
 	h := &Handler{
 		ps:       ps,
 		evalPool: evalPool,
@@ -72,7 +74,9 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"total_reads":         stats.TotalReads,
 		"total_writes":        stats.TotalWrites,
-		"dirty_files":         stats.DirtyFiles,
+		"l0_files":            stats.DirtyFiles,
+		"l1_files":            stats.TotalFolders,
+		"total_blocks":        stats.TotalBlocks,
 		"cached_blocks":       stats.CachedBlocks,
 		"read_only":           h.ps.IsReadOnly(),
 		"total_positions":     stats.TotalPositions,
@@ -83,8 +87,6 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 		"uncompressed_bytes":  stats.UncompressedBytes,
 		"compressed_bytes":    stats.CompressedBytes,
 		"total_games":         stats.TotalGames,
-		"total_folders":       stats.TotalFolders,
-		"total_blocks":        stats.TotalBlocks,
 	})
 }
 
@@ -497,81 +499,71 @@ func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, u
 			hasEval  bool
 		}
 
+		// Pre-allocate candidates and prepare moves (single-threaded, fast)
 		candidates := make([]moveCandidate, 0, len(moves))
 		for _, mv := range moves {
-			childPos := posKey.Unpack()
-			if childPos == nil {
-				continue
-			}
-
+			childPos := pos.Copy()
 			sanStr := mvToSAN(pos, mv, moves)
 
 			if err := pgn.ApplyMove(childPos, mv); err != nil {
 				continue
 			}
 
-			childKey := childPos.Pack()
-
-			// Get count and CP
-			var count uint32
-			var cp int16
-			var hasEval bool
-			if childRec, err := h.ps.Get(childKey); err == nil && childRec != nil {
-				count = uint32(childRec.Wins) + uint32(childRec.Draws) + uint32(childRec.Losses)
-				cp = childRec.CP
-				hasEval = childRec.HasCP() || childRec.DTM != store.DTMUnknown
-
-				// Queue all browsed child positions for eval if they don't have one
-				if !hasEval && h.evalPool != nil {
-					h.evalPool.EnqueueBrowse(childKey)
-				}
-			}
-
 			candidates = append(candidates, moveCandidate{
 				mv:       mv,
 				childPos: childPos,
-				childKey: childKey,
+				childKey: childPos.Pack(),
 				san:      sanStr,
 				uci:      moveToUCI(mv),
-				count:    count,
-				cp:       cp,
-				hasEval:  hasEval,
 			})
 		}
+
+		// Parallel lookup of position data (the slow part)
+		var wg sync.WaitGroup
+		for i := range candidates {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				c := &candidates[idx]
+				if childRec, err := h.ps.Get(c.childKey); err == nil && childRec != nil {
+					c.count = uint32(childRec.Wins) + uint32(childRec.Draws) + uint32(childRec.Losses)
+					c.cp = childRec.CP
+					c.hasEval = childRec.HasCP() || childRec.DTM != store.DTMUnknown
+
+					// Queue for eval if no eval yet
+					if !c.hasEval && h.evalPool != nil {
+						h.evalPool.EnqueueBrowse(c.childKey)
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
 
 		// Determine if white is to move (affects sort direction)
 		// CP is stored from white's perspective:
 		// - White wants highest CP (best for white)
 		// - Black wants lowest CP (best for black)
-		whiteToMove := strings.Contains(pos.ToFEN(), " w ")
+		whiteToMove := pos.SideToMove == pgn.White
 
 		// Sort by CP: best for current side first
 		// Positions without eval go to the end, sorted by count
-		for i := 0; i < len(candidates)-1; i++ {
-			for j := i + 1; j < len(candidates); j++ {
-				swap := false
-				ci, cj := candidates[i], candidates[j]
+		sort.Slice(candidates, func(i, j int) bool {
+			ci, cj := candidates[i], candidates[j]
 
-				if ci.hasEval && cj.hasEval {
-					// Both have eval: sort by CP
-					if whiteToMove {
-						swap = cj.cp > ci.cp // White wants highest CP
-					} else {
-						swap = cj.cp < ci.cp // Black wants lowest CP
-					}
-				} else if ci.hasEval != cj.hasEval {
-					// Prefer positions with eval
-					swap = cj.hasEval && !ci.hasEval
-				} else {
-					// Neither has eval: sort by count
-					swap = cj.count > ci.count
+			if ci.hasEval && cj.hasEval {
+				// Both have eval: sort by CP
+				if whiteToMove {
+					return ci.cp > cj.cp // White wants highest CP first
 				}
-
-				if swap {
-					candidates[i], candidates[j] = candidates[j], candidates[i]
-				}
+				return ci.cp < cj.cp // Black wants lowest CP first
 			}
-		}
+			if ci.hasEval != cj.hasEval {
+				// Prefer positions with eval
+				return ci.hasEval
+			}
+			// Neither has eval: sort by count (descending)
+			return ci.count > cj.count
+		})
 
 		// Take top N BEFORE recursing
 		// At root level, use fetchMoves (for sidebar list)
@@ -584,12 +576,17 @@ func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, u
 			candidates = candidates[:limit]
 		}
 
-		// Now recursively build only the top candidates
-		node.Children = make([]*TreeNode, 0, len(candidates))
-		for _, c := range candidates {
-			childNode := h.buildTreeNode(c.childPos, c.childKey, c.uci, c.san, depth-1, topMoves, fetchMoves, false)
-			node.Children = append(node.Children, childNode)
+		// Now recursively build only the top candidates (in parallel)
+		node.Children = make([]*TreeNode, len(candidates))
+		var childWg sync.WaitGroup
+		for i, c := range candidates {
+			childWg.Add(1)
+			go func(idx int, cand moveCandidate) {
+				defer childWg.Done()
+				node.Children[idx] = h.buildTreeNode(cand.childPos, cand.childKey, cand.uci, cand.san, depth-1, topMoves, fetchMoves, false)
+			}(i, c)
 		}
+		childWg.Wait()
 	}
 
 	return node

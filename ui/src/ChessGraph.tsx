@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Chessboard } from 'react-chessboard';
 import { fetchTree, fetchTreeWithMoves, TreeNode, PathNode, StatsResponse, fetchPositionByFen } from './api';
@@ -69,6 +69,12 @@ function formatNumber(n: number | undefined): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
   return n.toString();
+}
+
+// Check if any W/D/L count is saturated (maxed out at 65535)
+const WDL_SATURATED = 65535;
+function isWdlSaturated(wins: number, draws: number, losses: number): boolean {
+  return wins >= WDL_SATURATED || draws >= WDL_SATURATED || losses >= WDL_SATURATED;
 }
 
 // Format numbers with exact count (with commas)
@@ -160,8 +166,9 @@ export default function ChessGraph({
 
   const [navState, setNavState] = useState<NavigationState | null>(null);
   const [loading, setLoading] = useState(true);
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [boardOrientation, setBoardOrientation] = useState<BoardOrientation>('auto');
+  const [boardOrientation, setBoardOrientation] = useState<BoardOrientation>('white');
   const [hoveredMove, setHoveredMove] = useState<TreeNode | null>(null);
   const [showFenDialog, setShowFenDialog] = useState(false);
   const [fenInput, setFenInput] = useState('');
@@ -222,7 +229,28 @@ export default function ChessGraph({
         tree = await fetchTree(undefined, depth, topMoves, fetchMoves);
       }
 
-      setNavState({ current: tree, parents, sanMoves, lastMoveUci });
+      setNavState(prev => {
+        // For background refresh, check if we should update
+        if (!updateHistory && prev) {
+          // If user navigated elsewhere, skip this stale update entirely
+          if (prev.current.position !== tree.position) {
+            return prev;
+          }
+          // Same position - check if new data has more depth
+          // Compare grandchildren count as a proxy for depth
+          const prevGrandchildCount = prev.current.children?.reduce(
+            (sum, c) => sum + (c.children?.length || 0), 0
+          ) || 0;
+          const newGrandchildCount = tree.children?.reduce(
+            (sum, c) => sum + (c.children?.length || 0), 0
+          ) || 0;
+          // Skip update only if we already have equal or more depth
+          if (newGrandchildCount <= prevGrandchildCount) {
+            return prev;
+          }
+        }
+        return { current: tree, parents, sanMoves, lastMoveUci };
+      });
       if (updateHistory) {
         updateUrl(sanMoves, topMoves, depth);
       }
@@ -230,6 +258,7 @@ export default function ChessGraph({
       setError(err instanceof Error ? err.message : 'Failed to load position');
     } finally {
       setLoading(false);
+      setIsInitialLoad(false);
     }
   }, [depth, topMoves, fetchMoves]);
 
@@ -270,7 +299,53 @@ export default function ChessGraph({
       // Append SANs for all ancestors + the clicked node
       const ancestorSans = ancestors.map(a => a.san).filter((s): s is string => !!s);
       const newMoves = [...navState.sanMoves, ...ancestorSans, node.san];
-      loadTree(newMoves, true);
+
+      // Optimistic update: build the parent chain and navigate immediately
+      const newParents = [...navState.parents];
+      // Add current position as parent
+      newParents.push({
+        position: navState.current.position,
+        fen: navState.current.fen,
+        uci: navState.current.uci,
+        san: navState.current.san,
+        cp: navState.current.cp,
+        dtm: navState.current.dtm,
+        has_eval: navState.current.has_eval,
+        count: navState.current.count,
+        wins: navState.current.wins,
+        draws: navState.current.draws,
+        losses: navState.current.losses,
+        win_pct: navState.current.win_pct,
+        draw_pct: navState.current.draw_pct,
+      });
+      // Add ancestors as parents
+      for (const ancestor of ancestors) {
+        newParents.push({
+          position: ancestor.position,
+          fen: ancestor.fen,
+          uci: ancestor.uci,
+          san: ancestor.san,
+          cp: ancestor.cp,
+          dtm: ancestor.dtm,
+          has_eval: ancestor.has_eval,
+          count: ancestor.count,
+          wins: ancestor.wins,
+          draws: ancestor.draws,
+          losses: ancestor.losses,
+          win_pct: ancestor.win_pct,
+          draw_pct: ancestor.draw_pct,
+        });
+      }
+
+      setNavState({
+        current: node,
+        parents: newParents,
+        sanMoves: newMoves,
+        lastMoveUci: node.uci,
+      });
+      updateUrl(newMoves, topMoves, depth);
+
+      // Skip background fetch for smooth UX
     }
   };
 
@@ -302,6 +377,7 @@ export default function ChessGraph({
   };
 
   // Handle move made on the board - find matching child and navigate
+  // Uses optimistic update for smooth animation, then fetches fresh data
   const handleMove = (sourceSquare: string, targetSquare: string, piece: string): boolean => {
     if (!navState) return false;
 
@@ -316,26 +392,50 @@ export default function ChessGraph({
       uci += 'q'; // Default to queen promotion
     }
 
-    // Find child with matching UCI move, then use its SAN for the URL
-    const matchingChild = current.children.find(child => child.uci === uci);
+    // Find child with matching UCI move
+    let matchingChild = current.children.find(child => child.uci === uci);
+
+    // Try other promotion pieces if queen didn't match
+    if (!matchingChild && isPromotion) {
+      for (const promo of ['r', 'b', 'n']) {
+        const promoUci = sourceSquare + targetSquare + promo;
+        matchingChild = current.children.find(child => child.uci === promoUci);
+        if (matchingChild) break;
+      }
+    }
 
     if (matchingChild && matchingChild.san) {
       const newMoves = [...navState.sanMoves, matchingChild.san];
-      loadTree(newMoves, true);
-      return true;
-    }
 
-    // Try other promotion pieces if queen didn't match
-    if (isPromotion) {
-      for (const promo of ['r', 'b', 'n']) {
-        const promoUci = sourceSquare + targetSquare + promo;
-        const promoChild = current.children.find(child => child.uci === promoUci);
-        if (promoChild && promoChild.san) {
-          const newMoves = [...navState.sanMoves, promoChild.san];
-          loadTree(newMoves, true);
-          return true;
-        }
-      }
+      // Optimistic update: immediately navigate to the child we already have
+      // This prevents the board from blinking while we fetch fresh data
+      const newParents = [...navState.parents, {
+        position: current.position,
+        fen: current.fen,
+        uci: current.uci,
+        san: current.san,
+        cp: current.cp,
+        dtm: current.dtm,
+        has_eval: current.has_eval,
+        count: current.count,
+        wins: current.wins,
+        draws: current.draws,
+        losses: current.losses,
+        win_pct: current.win_pct,
+        draw_pct: current.draw_pct,
+      }];
+
+      setNavState({
+        current: matchingChild,
+        parents: newParents,
+        sanMoves: newMoves,
+        lastMoveUci: matchingChild.uci,
+      });
+      updateUrl(newMoves, topMoves, depth);
+
+      // Skip background fetch - optimistic update has enough data for smooth UX
+      // User can refresh or navigate again to get full depth if needed
+      return true;
     }
 
     return false; // Move not found in children - reject it
@@ -534,13 +634,13 @@ export default function ChessGraph({
                 </div>
                 <div className="stats-column">
                   <div className="stat-item">
-                    <span className="stat-value">{formatNumber(stats.total_blocks)}</span>
-                    <span className="stat-label">blocks</span>
+                    <span className="stat-value">{stats.l0_files}+{stats.l1_files}</span>
+                    <span className="stat-label">L0+L1 files</span>
                   </div>
                   {stats.total_blocks > 0 && stats.total_positions > 0 && (
                     <div className="stat-item">
-                      <span className="stat-value">{(stats.total_positions / stats.total_blocks).toFixed(1)}</span>
-                      <span className="stat-label">pos/block</span>
+                      <span className="stat-value">{formatNumber(Math.round(stats.total_positions / stats.total_blocks))}</span>
+                      <span className="stat-label">pos/file</span>
                     </div>
                   )}
                   <div className="stat-item">
@@ -657,6 +757,17 @@ export default function ChessGraph({
             </button>
             <div className="move-history-title">Moves</div>
           </div>
+          {(() => {
+            // Find the last ECO from path or current position
+            const eco = current.eco || current.path?.slice().reverse().find(p => p.eco)?.eco;
+            const opening = current.opening || current.path?.slice().reverse().find(p => p.opening)?.opening;
+            return eco ? (
+              <div className="eco-display">
+                <span className="eco-code">{eco}</span>
+                {opening && <span className="eco-name">{opening}</span>}
+              </div>
+            ) : null;
+          })()}
           <div className="move-list">
             {moveHistory.length === 0 ? (
               <div className="no-moves">Starting position</div>
@@ -700,13 +811,7 @@ export default function ChessGraph({
         </div>
 
         {/* Focused board (main) */}
-        <motion.div
-          className="board-wrapper focused"
-          key={current.position}
-          initial={{ opacity: 0, scale: 0.9 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ duration: 0.3 }}
-        >
+        <div className="board-wrapper focused">
           <Chessboard
             position={current.fen}
             boardWidth={225}
@@ -714,6 +819,7 @@ export default function ChessGraph({
             onPieceDrop={handleMove}
             boardOrientation={mainBoardOrientation}
             customSquareStyles={mainBoardHighlights}
+            animationDuration={200}
           />
           <div className="board-info">
             <div className="move-line">
@@ -729,7 +835,7 @@ export default function ChessGraph({
             </div>
           <WinBar wins={current.wins} draws={current.draws} losses={current.losses} />
         </div>
-      </motion.div>
+      </div>
 
         {/* All possible moves panel with hover preview */}
         <div className="all-moves-container">
@@ -759,7 +865,9 @@ export default function ChessGraph({
                         </span>
                       ) : null}
                     </span>
-                    <span className="move-count">{formatNumber(move.count)}</span>
+                    <span className="move-count">
+                      {isWdlSaturated(move.wins, move.draws, move.losses) ? 'many' : formatNumber(move.count)}
+                    </span>
                     {move.count > 0 ? (
                       <span className="move-wdl">
                         <span className="w">{move.win_pct.toFixed(0)}%</span>
@@ -809,23 +917,21 @@ export default function ChessGraph({
       )}
 
       {/* Recursive tree rendering */}
-      <AnimatePresence>
-        {current.children && current.children.length > 0 && (
-          <RootChildren
-            children={current.children}
-            depth={depth}
-            topMoves={topMoves}
-            onNodeClick={handleNodeClick}
-            formatStats={formatStats}
-            formatEval={formatEval}
-            getEvalClass={getEvalClass}
-            boardOrientation={boardOrientation}
-            parentFen={current.fen}
-          />
-        )}
-      </AnimatePresence>
+      {current.children && current.children.length > 0 && (
+        <RootChildren
+          children={current.children}
+          depth={depth}
+          topMoves={topMoves}
+          onNodeClick={handleNodeClick}
+          formatStats={formatStats}
+          formatEval={formatEval}
+          getEvalClass={getEvalClass}
+          boardOrientation={boardOrientation}
+          parentFen={current.fen}
+        />
+      )}
 
-      {loading && (
+      {loading && isInitialLoad && (
         <div className="loading-overlay">Loading...</div>
       )}
     </div>
@@ -868,13 +974,7 @@ function RootChildren({ children, depth, topMoves, onNodeClick, formatStats, for
   };
 
   return (
-    <motion.div
-      className="children-group"
-      initial={{ opacity: 0, y: 30 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: 30 }}
-      transition={{ duration: 0.3 }}
-    >
+    <div className="children-group">
       <div className="board-level">
         {canPaginate && (
           <button className="paginate-btn prev" onClick={handlePrev}>‹</button>
@@ -900,7 +1000,7 @@ function RootChildren({ children, depth, topMoves, onNodeClick, formatStats, for
           <button className="paginate-btn next" onClick={handleNext}>›</button>
         )}
       </div>
-    </motion.div>
+    </div>
   );
 }
 
@@ -920,7 +1020,7 @@ interface TreeBranchProps {
   parentFen: string;
 }
 
-function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onNodeClick, formatStats, formatEval, getEvalClass, boardOrientation, parentFen }: TreeBranchProps) {
+const TreeBranch = React.memo(function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onNodeClick, formatStats, formatEval, getEvalClass, boardOrientation, parentFen }: TreeBranchProps) {
   const [offset, setOffset] = useState(0);
 
   const getBoardSize = (lvl: number): number => {
@@ -960,15 +1060,12 @@ function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onN
 
   return (
     <div className="child-branch">
-      <motion.div
+      <div
         className={`board-wrapper level-${level}`}
         onClick={() => onNodeClick(node, ancestors)}
-        whileHover={{ scale: 1.05 }}
-        initial={{ opacity: 0, scale: 0.8 }}
-        animate={{ opacity: 1, scale: 1 }}
-        transition={{ duration: 0.2, delay: index * 0.03 }}
       >
         <Chessboard
+          key={node.position}
           position={node.fen}
           boardWidth={getBoardSize(level)}
           arePiecesDraggable={false}
@@ -991,7 +1088,7 @@ function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onN
           )}
           <WinBar wins={node.wins} draws={node.draws} losses={node.losses} />
         </div>
-      </motion.div>
+      </div>
 
       {showChildren && (
         <>
@@ -1027,7 +1124,14 @@ function TreeBranch({ node, level, maxLevel, index, visibleMoves, ancestors, onN
       )}
     </div>
   );
-}
+}, (prevProps, nextProps) => {
+  // Custom comparison - only re-render if the node position changes
+  return prevProps.node.position === nextProps.node.position &&
+    prevProps.level === nextProps.level &&
+    prevProps.maxLevel === nextProps.maxLevel &&
+    prevProps.visibleMoves === nextProps.visibleMoves &&
+    prevProps.boardOrientation === nextProps.boardOrientation;
+});
 
 // Win/Draw/Loss bar component
 function WinBar({ wins, draws, losses }: { wins: number; draws: number; losses: number }) {

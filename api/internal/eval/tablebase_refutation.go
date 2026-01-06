@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 	"github.com/rs/zerolog"
 
 	"github.com/freeeve/chessgraph/api/internal/store"
@@ -24,7 +24,7 @@ type RefutationScannerConfig struct {
 type RefutationScanner struct {
 	log  zerolog.Logger
 	cfg  RefutationScannerConfig
-	ps   *store.PositionStore
+	ps   store.ReadStore
 	pool *TablebasePool
 
 	// Stats
@@ -37,7 +37,7 @@ type RefutationScanner struct {
 }
 
 // NewRefutationScanner creates a new refutation scanner.
-func NewRefutationScanner(cfg RefutationScannerConfig, ps *store.PositionStore, pool *TablebasePool) *RefutationScanner {
+func NewRefutationScanner(cfg RefutationScannerConfig, ps store.ReadStore, pool *TablebasePool) *RefutationScanner {
 	if cfg.BadThreshold == 0 {
 		cfg.BadThreshold = -300
 	}

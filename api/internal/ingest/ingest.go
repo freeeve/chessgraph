@@ -6,9 +6,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 	"github.com/rs/zerolog"
 
 	"github.com/freeeve/chessgraph/api/internal/store"
@@ -22,25 +23,25 @@ type Pausable interface {
 
 // Config configures the ingest worker.
 type Config struct {
-	WatchDir      string         // Directory to watch for PGN files
-	ProcessedDir  string         // Directory to move processed files to
-	RatingMin     int            // Minimum rating filter
-	FlushEvery    int            // Flush after N games
-	DirtyMemLimit int64          // Memory limit for dirty blocks (bytes), 0 = use count-based
-	PollInterval  time.Duration  // How often to check for new files
-	Logger        zerolog.Logger // Logger
-	PauseDuring   []Pausable     // Components to pause during ingest
+	WatchDir       string         // Directory to watch for PGN files
+	ProcessedDir   string         // Directory to move processed files to
+	RatingMin      int            // Minimum rating filter
+	CheckFlushEvery int           // Check if flush needed every N games (default 1000)
+	DirtyMemLimit  int64          // Memory limit for dirty blocks (bytes), default 256MB
+	PollInterval   time.Duration  // How often to check for new files
+	Logger         zerolog.Logger // Logger
+	PauseDuring    []Pausable     // Components to pause during ingest
 }
 
 // Worker watches a folder and ingests PGN files.
 type Worker struct {
 	cfg Config
-	ps  *store.PositionStore
+	ps  store.IngestStore
 	log zerolog.Logger
 }
 
 // NewWorker creates a new ingest worker.
-func NewWorker(cfg Config, ps *store.PositionStore) (*Worker, error) {
+func NewWorker(cfg Config, ps store.IngestStore) (*Worker, error) {
 	if cfg.WatchDir == "" {
 		return nil, nil // Disabled
 	}
@@ -50,8 +51,11 @@ func NewWorker(cfg Config, ps *store.PositionStore) (*Worker, error) {
 	if cfg.RatingMin == 0 {
 		cfg.RatingMin = 2000
 	}
-	if cfg.FlushEvery == 0 {
-		cfg.FlushEvery = 10000
+	if cfg.CheckFlushEvery == 0 {
+		cfg.CheckFlushEvery = 100 // Check every 100 games (~8k positions)
+	}
+	if cfg.DirtyMemLimit == 0 {
+		cfg.DirtyMemLimit = 256 * 1024 * 1024 // 256MB default
 	}
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 10 * time.Second
@@ -96,7 +100,15 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 // processNewFiles finds and processes PGN files in the watch directory.
+// Processes up to NumWorkers files in parallel.
 func (w *Worker) processNewFiles(ctx context.Context) error {
+	// Early exit if context already cancelled
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	entries, err := os.ReadDir(w.cfg.WatchDir)
 	if err != nil {
 		return err
@@ -121,47 +133,102 @@ func (w *Worker) processNewFiles(ctx context.Context) error {
 	// Sort by name to process in order
 	sort.Strings(files)
 
-	w.log.Info().Int("count", len(files)).Msg("found PGN files to process")
+	numWorkers := w.ps.NumWorkers()
+	w.log.Info().Int("files", len(files)).Int("workers", numWorkers).Msg("found PGN files to process in parallel")
 
 	// Pause other components during ingest to reduce contention
 	for _, p := range w.cfg.PauseDuring {
 		p.Pause()
 	}
 	defer func() {
-		for _, p := range w.cfg.PauseDuring {
-			p.Resume()
+		// Only resume if not shutting down (context still valid)
+		if ctx.Err() == nil {
+			for _, p := range w.cfg.PauseDuring {
+				p.Resume()
+			}
 		}
 	}()
 
-	for _, name := range files {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+	// Process files in parallel with worker pool
+	type fileResult struct {
+		name string
+		err  error
+	}
 
-		path := filepath.Join(w.cfg.WatchDir, name)
-		if err := w.processFile(ctx, path); err != nil {
-			w.log.Error().Err(err).Str("file", name).Msg("ingest failed")
-			// Don't move failed files - leave for retry/inspection
+	fileChan := make(chan string, len(files))
+	resultChan := make(chan fileResult, len(files))
+
+	// Start worker goroutines
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for name := range fileChan {
+				select {
+				case <-ctx.Done():
+					resultChan <- fileResult{name: name, err: ctx.Err()}
+					continue
+				default:
+				}
+
+				path := filepath.Join(w.cfg.WatchDir, name)
+				err := w.processFileWorker(ctx, workerID, path)
+				resultChan <- fileResult{name: name, err: err}
+			}
+		}(i)
+	}
+
+	// Send files to workers
+	for _, name := range files {
+		fileChan <- name
+	}
+	close(fileChan)
+
+	// Wait for all workers to finish
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results and move processed files
+	var processed, failed int
+	for result := range resultChan {
+		if result.err != nil {
+			w.log.Error().Err(result.err).Str("file", result.name).Msg("ingest failed")
+			failed++
 			continue
 		}
 
 		// Move to processed folder
-		destPath := filepath.Join(w.cfg.ProcessedDir, name)
-		if err := os.Rename(path, destPath); err != nil {
-			w.log.Warn().Err(err).Str("file", name).Msg("move to processed failed")
+		srcPath := filepath.Join(w.cfg.WatchDir, result.name)
+		destPath := filepath.Join(w.cfg.ProcessedDir, result.name)
+		if err := os.Rename(srcPath, destPath); err != nil {
+			w.log.Warn().Err(err).Str("file", result.name).Msg("move to processed failed")
 		} else {
-			w.log.Info().Str("file", name).Msg("moved to processed")
+			w.log.Info().Str("file", result.name).Msg("moved to processed")
 		}
+		processed++
+	}
+
+	// Flush after processing all files in this batch
+	w.log.Info().Int("processed", processed).Int("failed", failed).Msg("batch complete, flushing...")
+	if err := w.ps.FlushAll(); err != nil {
+		w.log.Error().Err(err).Msg("flush after batch failed")
+	}
+
+	// Compact L0 -> L1 (merge and sort with best compression)
+	w.log.Info().Msg("compacting L0 -> L1...")
+	if err := w.ps.Compact(); err != nil {
+		w.log.Error().Err(err).Msg("compaction failed")
 	}
 
 	return nil
 }
 
-// processFile ingests a single PGN file.
-func (w *Worker) processFile(ctx context.Context, path string) error {
-	w.log.Info().Str("path", path).Msg("starting ingest")
+// processFileWorker ingests a single PGN file using a specific worker ID for memtable sharding.
+func (w *Worker) processFileWorker(ctx context.Context, workerID int, path string) error {
+	w.log.Info().Str("path", path).Int("worker", workerID).Msg("starting file ingest")
 
 	startTime := time.Now()
 	var gamesProcessed, positionsUpdated, gamesSkipped int64
@@ -190,75 +257,27 @@ gameLoop:
 			continue
 		}
 
-		// Determine result
-		result := game.Tags["Result"]
-		var isWin, isDraw, isLoss bool
-		switch result {
-		case "1-0":
-			isWin = true
-		case "0-1":
-			isLoss = true
-		case "1/2-1/2":
-			isDraw = true
-		default:
+		// Process game
+		positions := w.processGame(workerID, game)
+		if positions > 0 {
+			positionsUpdated += int64(positions)
+			gamesProcessed++
+
+			// Periodic flush check (by games) - only check this worker's memtable
+			if gamesProcessed%int64(w.cfg.CheckFlushEvery) == 0 {
+				w.ps.IncrementGameCount(uint64(w.cfg.CheckFlushEvery))
+				if err := w.ps.FlushWorkerIfNeeded(workerID); err != nil {
+					w.log.Warn().Err(err).Msg("flush during ingest failed")
+				}
+			}
+			// Also check by positions (every ~100k) in case games are very long
+			if positionsUpdated%100000 == 0 {
+				if err := w.ps.FlushWorkerIfNeeded(workerID); err != nil {
+					w.log.Warn().Err(err).Msg("flush during ingest failed")
+				}
+			}
+		} else {
 			gamesSkipped++
-			continue
-		}
-
-		// Replay game and update positions
-		pos := pgn.NewStartingPosition()
-		depth := 0
-
-		for _, mv := range game.Moves {
-			posKey := pos.Pack()
-
-			// Determine increments from side-to-move perspective
-			// Use Increment() to avoid disk reads - merges at flush time
-			whiteToMove := depth%2 == 0
-			var wins, draws, losses uint16
-			if whiteToMove {
-				if isWin {
-					wins = 1
-				} else if isDraw {
-					draws = 1
-				} else if isLoss {
-					losses = 1
-				}
-			} else {
-				// Flip perspective for black
-				if isLoss {
-					wins = 1
-				} else if isDraw {
-					draws = 1
-				} else if isWin {
-					losses = 1
-				}
-			}
-
-			if err := w.ps.Increment(posKey, wins, draws, losses); err != nil {
-				w.log.Warn().Err(err).Msg("increment position failed")
-				break
-			}
-			positionsUpdated++
-
-			if err := pgn.ApplyMove(pos, mv); err != nil {
-				break
-			}
-			depth++
-		}
-
-		gamesProcessed++
-
-		// Increment global game counter
-		w.ps.IncrementGameCount(1)
-
-		// Periodic flush (async to allow ingestion to continue)
-		if gamesProcessed > 0 && gamesProcessed%int64(w.cfg.FlushEvery) == 0 {
-			if w.cfg.DirtyMemLimit > 0 {
-				w.ps.FlushIfMemoryNeededAsync(w.cfg.DirtyMemLimit)
-			} else {
-				w.ps.FlushIfNeededAsync(256)
-			}
 		}
 
 		// Periodic logging
@@ -267,6 +286,7 @@ gameLoop:
 			gps := float64(gamesProcessed) / elapsed.Seconds()
 			w.log.Info().
 				Str("file", filepath.Base(path)).
+				Int("worker", workerID).
 				Int64("games", gamesProcessed).
 				Int64("skipped", gamesSkipped).
 				Int64("positions", positionsUpdated).
@@ -280,20 +300,85 @@ gameLoop:
 		return err
 	}
 
-	// Flush after file
-	w.ps.FlushAll()
+	// Increment remaining game count
+	remainder := gamesProcessed % int64(w.cfg.CheckFlushEvery)
+	if remainder > 0 {
+		w.ps.IncrementGameCount(uint64(remainder))
+	}
+
+	// Check if this worker's memtable needs flush
+	if err := w.ps.FlushWorkerIfNeeded(workerID); err != nil {
+		w.log.Warn().Err(err).Msg("flush after file failed")
+	}
 
 	elapsed := time.Since(startTime)
 	w.log.Info().
 		Str("file", filepath.Base(path)).
+		Int("worker", workerID).
 		Int64("games", gamesProcessed).
 		Int64("skipped", gamesSkipped).
 		Int64("positions", positionsUpdated).
 		Dur("elapsed", elapsed).
 		Float64("games_per_sec", float64(gamesProcessed)/elapsed.Seconds()).
-		Msg("ingest complete")
+		Msg("file ingest complete")
 
 	return nil
+}
+
+// processGame processes a single game and returns the number of positions updated.
+func (w *Worker) processGame(workerID int, game *pgn.Game) int {
+	// Determine result
+	result := game.Tags["Result"]
+	var isWin, isDraw, isLoss bool
+	switch result {
+	case "1-0":
+		isWin = true
+	case "0-1":
+		isLoss = true
+	case "1/2-1/2":
+		isDraw = true
+	}
+
+	// Replay game and update positions
+	pos := pgn.NewStartingPosition()
+	depth := 0
+	positions := 0
+
+	for _, mv := range game.Moves {
+		posKey := pos.Pack()
+
+		// Determine increments from side-to-move perspective
+		whiteToMove := depth%2 == 0
+		var wins, draws, losses uint16
+		if whiteToMove {
+			if isWin {
+				wins = 1
+			} else if isDraw {
+				draws = 1
+			} else if isLoss {
+				losses = 1
+			}
+		} else {
+			// Flip perspective for black
+			if isLoss {
+				wins = 1
+			} else if isDraw {
+				draws = 1
+			} else if isWin {
+				losses = 1
+			}
+		}
+
+		w.ps.IncrementWorker(workerID, posKey, wins, draws, losses)
+		positions++
+
+		if err := pgn.ApplyMove(pos, mv); err != nil {
+			break
+		}
+		depth++
+	}
+
+	return positions
 }
 
 func isPGNFile(name string) bool {

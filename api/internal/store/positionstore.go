@@ -9,12 +9,12 @@ package store
 import (
 	"bytes"
 	"container/list"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -25,40 +25,27 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/freeeve/chessgraph/api/internal/graph"
 )
 
 // Position store constants
 const (
-	// Block file format: castle/EP/STM in filename, key = wpawns + bpawns + pieces
-	// Filename: {wk:02x}{bk:02x}{castle:1x}{ep:1x}{stm}.block (7 chars + .block)
-	// EP encoding: 0-7 = files a-h, 8 = no EP
-	// Number of files: 64 × 64 × 16 × 9 × 2 = 1,179,648 (max, many invalid)
+	// V10 block structure: simple byte-based paths from 26-byte packed position
+	// - Level 1: {xx}.block - key: 25 bytes (first byte in path)
+	// - Level 2: {xx}/{yy}.block - key: 24 bytes
+	// - Level N: path has N bytes, key has 26-N bytes
+	// - Level 25: max depth, key is 1 byte
+	// Blocks split dynamically when they exceed MaxBlockSizeBytes
 
-	// BlockKeySize is the size of the position key within a block file
-	// Excludes king squares, castle, EP, STM (all in filename), includes:
-	// wpawns(6) + bpawns(6) + pieces(20) = 32 bytes
-	BlockKeySize = 32
+	// MaxBlockLevel is the deepest level (one byte per level from 26-byte packed position)
+	MaxBlockLevel = 25
 
-	// SuffixSize is the size of the suffix key (V6: just pieces, 20 bytes)
-	SuffixSize = 20
-
-	// MaxSuffixPieces is the maximum pieces in suffix (N, B, R, Q for both sides)
-	MaxSuffixPieces = 16
-
-	// PiecesSize is the size of the packed pieces data
-	PiecesSize = 20
-
-	// MaxPieces is the maximum pieces stored (N, B, R, Q for both sides)
-	MaxPieces = 16
-
-	// BlockRecordSize is the logical record size (key + data)
-	// Key: 32 bytes, Data: 14 bytes = 46 bytes total
-	BlockRecordSize = BlockKeySize + positionRecordSize // 32 + 14 = 46
+	// MaxBlockKeySize is the maximum block key size (26-byte packed position at level 0)
+	MaxBlockKeySize = 26
 
 	// DirtyEntrySize estimates actual memory per dirty map entry including Go map overhead
-	// BlockKey (32) + PositionRecord (14) + map bucket overhead (~48) = ~94 bytes
 	DirtyEntrySize = 100
 
 	// PSMetaFileName is the metadata file name
@@ -68,52 +55,15 @@ const (
 	PSMaxCachedBlocks = 1024
 
 	// Block file format constants
-	PSBlockMagic      = "CGPK"   // ChessGraph Position Block
-	PSBlockVersion    = uint8(7) // Format version 7
-	PSBlockHeaderSize = 16       // Magic(4) + Version(1) + Flags(1) + RecordCount(4) + Checksum(4) + Reserved(2)
+	PSBlockMagic      = "CGPK"    // ChessGraph Position Block
+	PSBlockVersionV10 = uint8(10) // V10: columnar data, contiguous keys
+	PSBlockVersionV11 = uint8(11) // V11: columnar data, striped keys (better compression)
+	PSBlockVersion    = PSBlockVersionV11 // Current write version
+	PSBlockHeaderSize = 17       // Magic(4) + Version(1) + Flags(1) + Level(1) + RecordCount(4) + Checksum(4) + Reserved(2)
 
-	// EP encoding for block filenames
-	BlockEPNone = 8 // No en passant (files 0-7 = a-h)
-)
-
-// Piece codes in PackedPosition format
-const (
-	psPieceEmpty = 0
-	psPieceWP    = 1
-	psPieceWN    = 2
-	psPieceWB    = 3
-	psPieceWR    = 4
-	psPieceWQ    = 5
-	psPieceWK    = 6
-	psPieceBP    = 7
-	psPieceBN    = 8
-	psPieceBB    = 9
-	psPieceBR    = 10
-	psPieceBQ    = 11
-	psPieceBK    = 12
-)
-
-// Flag constants from PackedPosition
-const (
-	psFlagSideToMove = 1 << 0
-	psFlagWKCastle   = 1 << 1
-	psFlagWQCastle   = 1 << 2
-	psFlagBKCastle   = 1 << 3
-	psFlagBQCastle   = 1 << 4
-	psNoEP           = 0xFF
-)
-
-// Suffix piece type encoding (4 bits, 0 = empty slot)
-const (
-	psSuffixEmpty = 0
-	psSuffixWN    = 1
-	psSuffixWB    = 2
-	psSuffixWR    = 3
-	psSuffixWQ    = 4
-	psSuffixBN    = 5
-	psSuffixBB    = 6
-	psSuffixBR    = 7
-	psSuffixBQ    = 8
+	// MaxBlockSizeBytes is the target maximum uncompressed block size (64MB)
+	// Blocks exceeding this will be split to the next level
+	MaxBlockSizeBytes = 64 * 1024 * 1024
 )
 
 const (
@@ -127,37 +77,8 @@ var (
 	ErrPSReadOnly    = errors.New("position store is read-only")
 )
 
-// PSPrefix encodes the prefix components that determine folder/filename
-// V6: Castle, EP, and STM are in the filename (base64 encoded with 48-bit pawns)
-type PSPrefix struct {
-	WKingSq  byte   // White king square (0-63)
-	BKingSq  byte   // Black king square (0-63)
-	WPawnsBB uint64 // White pawn bitboard (full 64-bit, compressed to 48-bit for storage)
-	BPawnsBB uint64 // Black pawn bitboard (full 64-bit, compressed to 48-bit for storage)
-	Castle   byte   // Castle rights (4 bits: WK, WQ, BK, BQ)
-	EP       byte   // En passant file (0-7) or 0xFF for none
-	STM      byte   // Side to move (0 = white, 1 = black)
-}
-
-// PSSuffix is the suffix key used for sorting within a block file (V6: just pieces)
-type PSSuffix [SuffixSize]byte
-
-// PSRecord combines a suffix key with position data (V6 format)
-type PSRecord struct {
-	Suffix PSSuffix
-	Data   PositionRecord
-}
-
-// BlockKey is the key for a position within a block file
-// Contains: wpawns(6) + bpawns(6) + pieces(20) = 32 bytes
-// King squares, castle, EP, STM are in the block filename
-type BlockKey [BlockKeySize]byte
-
-// BlockRecord combines a block key with position data
-type BlockRecord struct {
-	Key  BlockKey
-	Data PositionRecord
-}
+// Types PSPrefix, BlockKey, BlockRecord, LeveledBlockRecord
+// and functions BlockKeySizeAtLevel, BlockRecordSizeAtLevel are in positionstore_keys.go
 
 // PositionStore implements position-keyed storage for chess positions.
 // Positions are organized by:
@@ -198,12 +119,40 @@ type PositionStore struct {
 	flushRunning bool
 
 	log func(format string, args ...any)
+
+	// Configurable split threshold (defaults to MaxBlockSizeBytes)
+	maxBlockSizeBytes uint64
+
+	// Path resolution cache - avoids repeated os.Stat calls during ingestion
+	pathCache   map[uint64]pathCacheEntry // prefix hash -> resolved path/level
+	pathCacheMu sync.RWMutex
+
+	// Singleflight for block loading - prevents duplicate disk reads
+	blockLoadGroup singleflight.Group
+
+	// Eval log - appends eval data to CSV file during flush
+	evalLogPath    string              // path to eval CSV file (empty = disabled)
+	pendingEvals   []pendingEvalEntry  // buffered eval entries waiting for flush
+	pendingEvalsMu sync.Mutex
+}
+
+// pendingEvalEntry stores an eval to be written to the CSV log
+type pendingEvalEntry struct {
+	pos    graph.PositionKey
+	record PositionRecord
+}
+
+// pathCacheEntry stores a cached path resolution result
+type pathCacheEntry struct {
+	path  string
+	level int
 }
 
 // psBlockCache stores decompressed block data
 type psBlockCache struct {
 	filename string
 	records  []BlockRecord
+	level    int // block level (determines key size)
 }
 
 // psCacheEntry is an LRU cache entry
@@ -217,6 +166,12 @@ type psCacheEntry struct {
 type dirtyBlock struct {
 	records []BlockRecord // append-only until compacted
 	sorted  bool          // true if sorted and compacted (no duplicates)
+	level   int           // block level (determines key size)
+}
+
+// keySize returns the key size for this dirty block
+func (db *dirtyBlock) keySize() int {
+	return BlockKeySizeAtLevel(db.level)
 }
 
 // compact sorts records and merges duplicates.
@@ -227,37 +182,39 @@ func (db *dirtyBlock) compact() {
 		return
 	}
 
-	// Sort by key
+	keySize := db.keySize()
+
+	// Sort by key (only compare relevant bytes based on level)
 	sort.Slice(db.records, func(i, j int) bool {
-		return bytes.Compare(db.records[i].Key[:], db.records[j].Key[:]) < 0
+		return bytes.Compare(db.records[i].Key[:keySize], db.records[j].Key[:keySize]) < 0
 	})
 
 	// Merge duplicates in place
 	// For same key: sum counts, take last non-zero eval fields
 	w := 0 // write index
 	for r := 0; r < len(db.records); r++ {
-		if w > 0 && db.records[w-1].Key == db.records[r].Key {
+		if w > 0 && bytes.Equal(db.records[w-1].Key[:keySize], db.records[r].Key[:keySize]) {
 			// Merge with previous
 			prev := &db.records[w-1]
 			curr := &db.records[r]
 
-			// Sum counts with overflow protection
-			newWins := uint32(prev.Data.Wins) + uint32(curr.Data.Wins)
-			if newWins > 65535 {
-				prev.Data.Wins = 65535
-			} else {
+			// Skip count updates if any field is already saturated (preserves ratios)
+			if prev.Data.Wins < 65535 && prev.Data.Draws < 65535 && prev.Data.Losses < 65535 {
+				// Sum counts with clamping at 65535
+				newWins := uint32(prev.Data.Wins) + uint32(curr.Data.Wins)
+				if newWins > 65535 {
+					newWins = 65535
+				}
+				newDraws := uint32(prev.Data.Draws) + uint32(curr.Data.Draws)
+				if newDraws > 65535 {
+					newDraws = 65535
+				}
+				newLosses := uint32(prev.Data.Losses) + uint32(curr.Data.Losses)
+				if newLosses > 65535 {
+					newLosses = 65535
+				}
 				prev.Data.Wins = uint16(newWins)
-			}
-			newDraws := uint32(prev.Data.Draws) + uint32(curr.Data.Draws)
-			if newDraws > 65535 {
-				prev.Data.Draws = 65535
-			} else {
 				prev.Data.Draws = uint16(newDraws)
-			}
-			newLosses := uint32(prev.Data.Losses) + uint32(curr.Data.Losses)
-			if newLosses > 65535 {
-				prev.Data.Losses = 65535
-			} else {
 				prev.Data.Losses = uint16(newLosses)
 			}
 
@@ -284,10 +241,11 @@ func (db *dirtyBlock) compact() {
 // Compacts if needed.
 func (db *dirtyBlock) lookup(key BlockKey) *PositionRecord {
 	db.compact()
+	keySize := db.keySize()
 	idx := sort.Search(len(db.records), func(i int) bool {
-		return bytes.Compare(db.records[i].Key[:], key[:]) >= 0
+		return bytes.Compare(db.records[i].Key[:keySize], key[:keySize]) >= 0
 	})
-	if idx < len(db.records) && db.records[idx].Key == key {
+	if idx < len(db.records) && bytes.Equal(db.records[idx].Key[:keySize], key[:keySize]) {
 		return &db.records[idx].Data
 	}
 	return nil
@@ -321,15 +279,17 @@ func NewPositionStore(dir string, maxCached int) (*PositionStore, error) {
 	}
 
 	ps := &PositionStore{
-		dir:            dir,
-		encoder:        encoder,
-		decoder:        decoder,
-		cache:          make(map[string]*list.Element),
-		cacheList:      list.New(),
-		maxCached:      maxCached,
-		dirtyBlocks:    make(map[string]*dirtyBlock),
-		inflightBlocks: make(map[string][]BlockRecord),
-		log:            func(format string, args ...any) {},
+		dir:               dir,
+		encoder:           encoder,
+		decoder:           decoder,
+		cache:             make(map[string]*list.Element),
+		cacheList:         list.New(),
+		maxCached:         maxCached,
+		dirtyBlocks:       make(map[string]*dirtyBlock),
+		inflightBlocks:    make(map[string][]BlockRecord),
+		log:               func(format string, args ...any) {},
+		maxBlockSizeBytes: MaxBlockSizeBytes,
+		pathCache:         make(map[uint64]pathCacheEntry),
 	}
 
 	// Load metadata if it exists
@@ -339,12 +299,50 @@ func NewPositionStore(dir string, maxCached int) (*PositionStore, error) {
 		return nil, fmt.Errorf("load metadata: %w", err)
 	}
 
+	// Enable eval logging by default
+	evalLogPath := filepath.Join(dir, "eval_log.csv")
+	if err := ps.SetEvalLogPath(evalLogPath); err != nil {
+		// Non-fatal, just log and continue
+		ps.log("warning: failed to enable eval logging: %v", err)
+	}
+
 	return ps, nil
 }
 
 // SetLogger sets a logging function
 func (ps *PositionStore) SetLogger(log func(format string, args ...any)) {
 	ps.log = log
+}
+
+// SetMaxBlockSize sets the maximum uncompressed block size threshold for splitting.
+// Use this for testing with smaller thresholds. Defaults to MaxBlockSizeBytes (128MB).
+func (ps *PositionStore) SetMaxBlockSize(size uint64) {
+	ps.maxBlockSizeBytes = size
+}
+
+// SetEvalLogPath enables eval CSV logging. When set, all evals written via Put()
+// will be appended to the specified CSV file during FlushAll().
+// The CSV format is: fen,position,cp,dtm,dtz,proven_depth
+// If the file doesn't exist, it will be created with a header row.
+func (ps *PositionStore) SetEvalLogPath(path string) error {
+	if ps.readOnly {
+		return ErrPSReadOnly
+	}
+	ps.evalLogPath = path
+
+	// Create file with header if it doesn't exist
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		f, err := os.Create(path)
+		if err != nil {
+			return fmt.Errorf("create eval log: %w", err)
+		}
+		if _, err := f.WriteString("fen,position,cp,dtm,dtz,proven_depth\n"); err != nil {
+			f.Close()
+			return fmt.Errorf("write eval log header: %w", err)
+		}
+		f.Close()
+	}
+	return nil
 }
 
 // NewPositionStoreReadOnly opens a position store in read-only mode.
@@ -360,15 +358,17 @@ func NewPositionStoreReadOnly(dir string, maxCached int) (*PositionStore, error)
 	}
 
 	ps := &PositionStore{
-		dir:            dir,
-		decoder:        decoder,
-		readOnly:       true,
-		cache:          make(map[string]*list.Element),
-		cacheList:      list.New(),
-		maxCached:      maxCached,
-		dirtyBlocks:    make(map[string]*dirtyBlock),
-		inflightBlocks: make(map[string][]BlockRecord),
-		log:            func(format string, args ...any) {},
+		dir:               dir,
+		decoder:           decoder,
+		readOnly:          true,
+		cache:             make(map[string]*list.Element),
+		cacheList:         list.New(),
+		maxCached:         maxCached,
+		dirtyBlocks:       make(map[string]*dirtyBlock),
+		inflightBlocks:    make(map[string][]BlockRecord),
+		log:               func(format string, args ...any) {},
+		maxBlockSizeBytes: MaxBlockSizeBytes,
+		pathCache:         make(map[uint64]pathCacheEntry),
 	}
 
 	// Load metadata if it exists
@@ -430,12 +430,15 @@ func CheckLockFile(dir string) bool {
 // Close flushes all pending writes, saves metadata, and closes resources
 func (ps *PositionStore) Close() error {
 	if !ps.readOnly {
-		if err := ps.FlushAll(); err != nil {
-			if ps.encoder != nil {
-				ps.encoder.Close()
+		// Only flush if there's dirty data or an async flush is in progress
+		if ps.DirtyCount() > 0 || ps.IsFlushRunning() {
+			if err := ps.FlushAll(); err != nil {
+				if ps.encoder != nil {
+					ps.encoder.Close()
+				}
+				ps.decoder.Close()
+				return err
 			}
-			ps.decoder.Close()
-			return err
 		}
 		// Save metadata before closing
 		if err := ps.SaveMeta(); err != nil {
@@ -449,292 +452,93 @@ func (ps *PositionStore) Close() error {
 	return nil
 }
 
-// ExtractPrefix extracts the prefix components from a PackedPosition
-// V6: King squares, pawn bitboards, castle rights, and EP file
-func ExtractPrefix(pos graph.PositionKey) PSPrefix {
-	var prefix PSPrefix
+// Key extraction and path building functions are in positionstore_keys.go:
+// ExtractPrefix, ExtractBlockKeyAtLevel, PSPrefix.PathAtLevel, etc.
 
-	// Scan board for kings and pawns
-	for sq := 0; sq < 64; sq++ {
-		byteIdx := sq / 2
-		var code byte
-		if sq%2 == 0 {
-			code = pos[byteIdx] & 0x0F
-		} else {
-			code = (pos[byteIdx] >> 4) & 0x0F
+// ResolveBlockPath finds the block file path for a prefix by traversing the trie.
+// Returns the path and level where the block exists (or should be created).
+// If no block exists, returns level 1 path.
+// Uses a cache to avoid repeated os.Stat calls during ingestion.
+func (ps *PositionStore) ResolveBlockPath(prefix PSPrefix) (path string, level int) {
+	// Check cache first
+	hash := prefix.Hash()
+	ps.pathCacheMu.RLock()
+	if entry, ok := ps.pathCache[hash]; ok {
+		ps.pathCacheMu.RUnlock()
+		return entry.path, entry.level
+	}
+	ps.pathCacheMu.RUnlock()
+
+	// Cache miss - do the expensive lookup
+	path, level = ps.resolveBlockPathUncached(prefix)
+
+	// Store in cache
+	ps.pathCacheMu.Lock()
+	ps.pathCache[hash] = pathCacheEntry{path: path, level: level}
+	ps.pathCacheMu.Unlock()
+
+	return path, level
+}
+
+// resolveBlockPathUncached does the actual path resolution without caching.
+// V10: Simplified byte-based paths - check each level until we find a block file or no directory.
+func (ps *PositionStore) resolveBlockPathUncached(prefix PSPrefix) (path string, level int) {
+	// Check from level 1 upward until we find a block file (not a directory)
+	for level = 1; level <= MaxBlockLevel; level++ {
+		path = prefix.PathAtLevel(level)
+		fullPath := filepath.Join(ps.dir, path)
+
+		info, err := os.Stat(fullPath)
+		if err == nil && !info.IsDir() {
+			// Found a block file
+			return path, level
 		}
 
-		switch code {
-		case psPieceWK:
-			prefix.WKingSq = byte(sq)
-		case psPieceBK:
-			prefix.BKingSq = byte(sq)
-		case psPieceWP:
-			prefix.WPawnsBB |= 1 << sq
-		case psPieceBP:
-			prefix.BPawnsBB |= 1 << sq
+		// Check if this level's path is a directory (meaning we need to go deeper)
+		dirPath := strings.TrimSuffix(fullPath, ".block")
+		dirInfo, err := os.Stat(dirPath)
+		if err != nil || !dirInfo.IsDir() {
+			// No directory at this level - block should be created here
+			return path, level
 		}
+		// Directory exists, continue to next level
 	}
 
-	// Extract castle rights (bits 1-4 of flags byte)
-	prefix.Castle = (pos[32] >> 1) & 0x0F
-
-	// Extract EP file
-	prefix.EP = pos[33]
-
-	// Extract side to move (bit 0 of flags byte)
-	prefix.STM = pos[32] & psFlagSideToMove
-
-	return prefix
+	// Reached max level
+	return prefix.PathAtLevel(MaxBlockLevel), MaxBlockLevel
 }
 
-// ExtractSuffix extracts the suffix key from a PackedPosition
-// V6 suffix is: [packed_pieces:20] = 20 bytes (just pieces, no STM)
-// Castle/EP/STM are now in the filename (prefix)
-// Pieces are packed as 16 slots × 10 bits each = 160 bits = 20 bytes
-// Each slot: [piece_type:4 bits][square:6 bits]
-// Pieces are stored in canonical order (by type, then by square)
-func ExtractSuffix(pos graph.PositionKey) PSSuffix {
-	var suffix PSSuffix
-
-	// Collect pieces by type using fixed-size arrays (no allocations)
-	// pieceSquares[type][count] = square, pieceCounts[type] = count
-	var pieceSquares [9][10]byte // index 1-8, max 10 pieces per type
-	var pieceCounts [9]int
-
-	for sq := 0; sq < 64; sq++ {
-		byteIdx := sq / 2
-		var code byte
-		if sq%2 == 0 {
-			code = pos[byteIdx] & 0x0F
-		} else {
-			code = (pos[byteIdx] >> 4) & 0x0F
-		}
-
-		// Map PackedPosition piece code to suffix piece type
-		var suffixType byte
-		switch code {
-		case psPieceWN:
-			suffixType = psSuffixWN
-		case psPieceWB:
-			suffixType = psSuffixWB
-		case psPieceWR:
-			suffixType = psSuffixWR
-		case psPieceWQ:
-			suffixType = psSuffixWQ
-		case psPieceBN:
-			suffixType = psSuffixBN
-		case psPieceBB:
-			suffixType = psSuffixBB
-		case psPieceBR:
-			suffixType = psSuffixBR
-		case psPieceBQ:
-			suffixType = psSuffixBQ
-		default:
-			continue // Skip empty, kings, pawns
-		}
-
-		if pieceCounts[suffixType] < 10 {
-			pieceSquares[suffixType][pieceCounts[suffixType]] = byte(sq)
-			pieceCounts[suffixType]++
-		}
-	}
-
-	// Pack pieces into suffix bytes 0-19
-	// Each piece is 10 bits: [type:4][square:6]
-	// We pack them sequentially as a bit stream
-	var bitPos uint = 0
-	for pieceType := byte(1); pieceType <= 8; pieceType++ {
-		for i := 0; i < pieceCounts[pieceType]; i++ {
-			if bitPos >= 160 {
-				break // Max 16 pieces
-			}
-			sq := pieceSquares[pieceType][i]
-			// Pack 10-bit value: (pieceType << 6) | sq
-			val := uint16(pieceType)<<6 | uint16(sq)
-			packBits(&suffix, 0, bitPos, val, 10)
-			bitPos += 10
-		}
-	}
-
-	return suffix
+// InvalidatePathCache clears the path resolution cache.
+// Should be called after block splits or other structural changes.
+func (ps *PositionStore) InvalidatePathCache() {
+	ps.pathCacheMu.Lock()
+	ps.pathCache = make(map[uint64]pathCacheEntry)
+	ps.pathCacheMu.Unlock()
 }
 
-// ExtractBlockKey extracts the pack key from a PackedPosition (V7 format)
-// Pack key: [wpawns48:6][bpawns48:6][pieces:20] = 32 bytes
-// King squares, castle, EP, STM are extracted from prefix (in filename)
-func ExtractBlockKey(pos graph.PositionKey) BlockKey {
-	var key BlockKey
-
-	// Extract pawn bitboards
-	var wpBB, bpBB uint64
-	for sq := 0; sq < 64; sq++ {
-		byteIdx := sq / 2
-		var code byte
-		if sq%2 == 0 {
-			code = pos[byteIdx] & 0x0F
-		} else {
-			code = (pos[byteIdx] >> 4) & 0x0F
-		}
-		switch code {
-		case psPieceWP:
-			wpBB |= 1 << sq
-		case psPieceBP:
-			bpBB |= 1 << sq
-		}
-	}
-
-	// Pack white pawns (48 bits = 6 bytes)
-	wp48 := pawnBBTo48(wpBB)
-	key[0] = byte(wp48 >> 40)
-	key[1] = byte(wp48 >> 32)
-	key[2] = byte(wp48 >> 24)
-	key[3] = byte(wp48 >> 16)
-	key[4] = byte(wp48 >> 8)
-	key[5] = byte(wp48)
-
-	// Pack black pawns (48 bits = 6 bytes)
-	bp48 := pawnBBTo48(bpBB)
-	key[6] = byte(bp48 >> 40)
-	key[7] = byte(bp48 >> 32)
-	key[8] = byte(bp48 >> 24)
-	key[9] = byte(bp48 >> 16)
-	key[10] = byte(bp48 >> 8)
-	key[11] = byte(bp48)
-
-	// Extract and pack pieces (20 bytes, same as suffix)
-	suffix := ExtractSuffix(pos)
-	copy(key[12:32], suffix[:])
-
-	return key
-}
-
-// packBits packs a value into the suffix byte array at the given bit position
-func packBits(suffix *PSSuffix, startByte int, bitPos uint, val uint16, numBits uint) {
-	for i := uint(0); i < numBits; i++ {
-		bit := (val >> (numBits - 1 - i)) & 1
-		byteIdx := startByte + int((bitPos+i)/8)
-		bitIdx := 7 - ((bitPos + i) % 8)
-		if bit == 1 {
-			suffix[byteIdx] |= 1 << bitIdx
-		}
-	}
-}
-
-// FolderName returns the folder name for a prefix
-func (p PSPrefix) FolderName() string {
-	return fmt.Sprintf("%02x%02x", p.WKingSq, p.BKingSq)
-}
-
-// BlockFileName returns the pack file name for a prefix (V7 format)
-// Format: {wk:02x}{bk:02x}{castle:1x}{ep:1x}{stm}.block (12 chars total)
-// EP encoding: 0-7 = files a-h, 8 = no EP
-func (p PSPrefix) BlockFileName() string {
-	ep := p.EP
-	if ep == psNoEP || ep > 7 {
-		ep = BlockEPNone
-	}
-	return fmt.Sprintf("%02x%02x%x%x%d.block", p.WKingSq, p.BKingSq, p.Castle&0x0F, ep, p.STM&0x01)
-}
-
-// ParseBlockFileName extracts prefix components from a pack filename
-// Returns wk, bk, castle, ep, stm
-func ParseBlockFileName(name string) (wk, bk, castle, ep, stm byte, err error) {
-	// Remove .block extension
-	if !strings.HasSuffix(name, ".block") {
-		return 0, 0, 0, 0, 0, fmt.Errorf("invalid pack filename: %s", name)
-	}
-	base := strings.TrimSuffix(name, ".block")
-	if len(base) != 7 {
-		return 0, 0, 0, 0, 0, fmt.Errorf("invalid pack filename length: %s", name)
-	}
-
-	// Parse components
-	var wk64, bk64, castle64, ep64, stm64 uint64
-	_, err = fmt.Sscanf(base, "%02x%02x%1x%1x%1d", &wk64, &bk64, &castle64, &ep64, &stm64)
-	if err != nil {
-		return 0, 0, 0, 0, 0, fmt.Errorf("parse pack filename: %w", err)
-	}
-
-	wk = byte(wk64)
-	bk = byte(bk64)
-	castle = byte(castle64)
-	ep = byte(ep64)
-	if ep == BlockEPNone {
-		ep = psNoEP
-	}
-	stm = byte(stm64)
-
-	return wk, bk, castle, ep, stm, nil
-}
-
-// pawnBBTo48 converts a 64-bit pawn bitboard to 48-bit (only ranks 2-7)
-// Pawns can only legally be on squares 8-55, so we shift and mask
-func pawnBBTo48(bb uint64) uint64 {
-	return (bb >> 8) & 0xFFFFFFFFFFFF // shift down by 8 (rank 1), keep 48 bits
-}
-
-// pawnBBFrom48 converts a 48-bit pawn representation back to 64-bit
-func pawnBBFrom48(packed uint64) uint64 {
-	return (packed & 0xFFFFFFFFFFFF) << 8 // mask to 48 bits, shift up by 8
-}
-
-// FileName returns the file name for a prefix (without folder)
-// V6: Base64 encoded 48-bit pawns + castle + EP + STM = 105 bits = 14 bytes = 19 chars
-func (p PSPrefix) FileName() string {
-	// Pack: [wpawns48:6bytes][bpawns48:6bytes][castle:4|ep:4][stm:1|pad:7] = 14 bytes
-	var buf [14]byte
-
-	// White pawns (48 bits = 6 bytes, big endian)
-	wp48 := pawnBBTo48(p.WPawnsBB)
-	buf[0] = byte(wp48 >> 40)
-	buf[1] = byte(wp48 >> 32)
-	buf[2] = byte(wp48 >> 24)
-	buf[3] = byte(wp48 >> 16)
-	buf[4] = byte(wp48 >> 8)
-	buf[5] = byte(wp48)
-
-	// Black pawns (48 bits = 6 bytes, big endian)
-	bp48 := pawnBBTo48(p.BPawnsBB)
-	buf[6] = byte(bp48 >> 40)
-	buf[7] = byte(bp48 >> 32)
-	buf[8] = byte(bp48 >> 24)
-	buf[9] = byte(bp48 >> 16)
-	buf[10] = byte(bp48 >> 8)
-	buf[11] = byte(bp48)
-
-	// Castle (4 bits) + EP (4 bits)
-	ep := p.EP
-	if ep == psNoEP {
-		ep = 0x0F
-	}
-	buf[12] = (p.Castle << 4) | (ep & 0x0F)
-
-	// STM (1 bit in high bit, rest padding)
-	buf[13] = (p.STM & 0x01) << 7
-
-	// URL-safe base64 encoding (14 bytes = 19 chars)
-	encoded := base64.RawURLEncoding.EncodeToString(buf[:])
-	return encoded + ".blk"
-}
-
-// Path returns the full relative path for a prefix
-func (p PSPrefix) Path() string {
-	return filepath.Join(p.FolderName(), p.FileName())
-}
+// ExtractBlockKeyAtLevel, PSPrefix.FileName, PSPrefix.Path are in positionstore_keys.go
 
 // Get retrieves a position record by its key.
 // Dirty records are merged with disk data to ensure we don't lose eval
 // data when only counts are updated in the dirty block.
 func (ps *PositionStore) Get(pos graph.PositionKey) (*PositionRecord, error) {
-	prefix := ExtractPrefix(pos)
-	blockKey := ExtractBlockKey(pos)
-	filename := prefix.BlockFileName()
+	// Extract all position data in a single pass through the board
+	pd := ExtractPositionData(pos)
+	prefix := pd.BuildPrefix()
+
+	// Resolve the block path and level
+	path, level := ps.ResolveBlockPath(prefix)
+
+	// Build key from pre-extracted data (no second board scan)
+	keyBytes := pd.BuildBlockKeyAtLevel(level)
+	var blockKey BlockKey
+	copy(blockKey[:], keyBytes)
+	keySize := BlockKeySizeAtLevel(level)
 
 	// Check dirty buffer and inflight (sorts and compacts on demand)
 	var dirtyRec *PositionRecord
 	ps.dirtyMu.Lock()
-	if db, ok := ps.dirtyBlocks[filename]; ok {
+	if db, ok := ps.dirtyBlocks[path]; ok {
 		if rec := db.lookup(blockKey); rec != nil {
 			r := *rec // copy
 			dirtyRec = &r
@@ -742,11 +546,11 @@ func (ps *PositionStore) Get(pos graph.PositionKey) (*PositionRecord, error) {
 	}
 	// Check inflight records (being flushed to disk)
 	if dirtyRec == nil {
-		if records, ok := ps.inflightBlocks[filename]; ok {
+		if records, ok := ps.inflightBlocks[path]; ok {
 			idx := sort.Search(len(records), func(i int) bool {
-				return bytes.Compare(records[i].Key[:], blockKey[:]) >= 0
+				return bytes.Compare(records[i].Key[:keySize], blockKey[:keySize]) >= 0
 			})
-			if idx < len(records) && records[idx].Key == blockKey {
+			if idx < len(records) && bytes.Equal(records[idx].Key[:keySize], blockKey[:keySize]) {
 				r := records[idx].Data // copy
 				dirtyRec = &r
 			}
@@ -755,7 +559,7 @@ func (ps *PositionStore) Get(pos graph.PositionKey) (*PositionRecord, error) {
 	ps.dirtyMu.Unlock()
 
 	// Load block file to get disk data
-	block, err := ps.getBlockFile(filename)
+	block, err := ps.getBlockFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -764,9 +568,9 @@ func (ps *PositionStore) Get(pos graph.PositionKey) (*PositionRecord, error) {
 	var diskRec *PositionRecord
 	if block != nil {
 		idx := sort.Search(len(block.records), func(i int) bool {
-			return bytes.Compare(block.records[i].Key[:], blockKey[:]) >= 0
+			return bytes.Compare(block.records[i].Key[:keySize], blockKey[:keySize]) >= 0
 		})
-		if idx < len(block.records) && block.records[idx].Key == blockKey {
+		if idx < len(block.records) && bytes.Equal(block.records[idx].Key[:keySize], blockKey[:keySize]) {
 			r := block.records[idx].Data // copy
 			diskRec = &r
 		}
@@ -785,9 +589,24 @@ func (ps *PositionStore) Get(pos graph.PositionKey) (*PositionRecord, error) {
 
 	// Both exist - merge: sum counts, keep eval from dirty if it has one, else disk
 	merged := *diskRec
-	merged.Wins = uint16(min(65535, int(merged.Wins)+int(dirtyRec.Wins)))
-	merged.Draws = uint16(min(65535, int(merged.Draws)+int(dirtyRec.Draws)))
-	merged.Losses = uint16(min(65535, int(merged.Losses)+int(dirtyRec.Losses)))
+	// Skip count updates if any field is already saturated (preserves ratios)
+	if merged.Wins < 65535 && merged.Draws < 65535 && merged.Losses < 65535 {
+		newWins := int(merged.Wins) + int(dirtyRec.Wins)
+		if newWins > 65535 {
+			newWins = 65535
+		}
+		newDraws := int(merged.Draws) + int(dirtyRec.Draws)
+		if newDraws > 65535 {
+			newDraws = 65535
+		}
+		newLosses := int(merged.Losses) + int(dirtyRec.Losses)
+		if newLosses > 65535 {
+			newLosses = 65535
+		}
+		merged.Wins = uint16(newWins)
+		merged.Draws = uint16(newDraws)
+		merged.Losses = uint16(newLosses)
+	}
 	if dirtyRec.HasCP() || dirtyRec.DTM != DTMUnknown || dirtyRec.DTZ != 0 {
 		merged.CP = dirtyRec.CP
 		merged.DTM = dirtyRec.DTM
@@ -803,25 +622,40 @@ func (ps *PositionStore) Put(pos graph.PositionKey, record *PositionRecord) erro
 		return ErrPSReadOnly
 	}
 
-	prefix := ExtractPrefix(pos)
-	blockKey := ExtractBlockKey(pos)
-	filename := prefix.BlockFileName()
+	// Extract all position data in a single pass through the board
+	pd := ExtractPositionData(pos)
+	prefix := pd.BuildPrefix()
+
+	// Resolve the block path and level
+	path, level := ps.ResolveBlockPath(prefix)
+
+	// Build key from pre-extracted data (no second board scan)
+	keyBytes := pd.BuildBlockKeyAtLevel(level)
+	var blockKey BlockKey
+	copy(blockKey[:], keyBytes)
 
 	ps.dirtyMu.Lock()
 	defer ps.dirtyMu.Unlock()
 
-	// Get or create the dirty block for this filename
-	db := ps.dirtyBlocks[filename]
+	// Get or create the dirty block for this path
+	db := ps.dirtyBlocks[path]
 	if db == nil {
-		db = &dirtyBlock{records: make([]BlockRecord, 0, 64)}
-		ps.dirtyBlocks[filename] = db
-		ps.dirtyBytes += int64(len(filename)) + 50 // outer map entry overhead
+		db = &dirtyBlock{records: make([]BlockRecord, 0, 64), level: level}
+		ps.dirtyBlocks[path] = db
+		ps.dirtyBytes += int64(len(path)) + 50 // outer map entry overhead
 	}
 
 	// Append record - merging happens at compact time
 	db.append(BlockRecord{Key: blockKey, Data: *record})
 	ps.dirtyBytes += DirtyEntrySize
 	ps.totalWrites++
+
+	// Track eval for CSV log if enabled and this record has eval data
+	if ps.evalLogPath != "" && (record.HasCP() || record.DTM != DTMUnknown || record.DTZ != 0) {
+		ps.pendingEvalsMu.Lock()
+		ps.pendingEvals = append(ps.pendingEvals, pendingEvalEntry{pos: pos, record: *record})
+		ps.pendingEvalsMu.Unlock()
+	}
 
 	return nil
 }
@@ -835,19 +669,27 @@ func (ps *PositionStore) Increment(pos graph.PositionKey, wins, draws, losses ui
 		return ErrPSReadOnly
 	}
 
-	prefix := ExtractPrefix(pos)
-	blockKey := ExtractBlockKey(pos)
-	filename := prefix.BlockFileName()
+	// Extract all position data in a single pass through the board
+	pd := ExtractPositionData(pos)
+	prefix := pd.BuildPrefix()
+
+	// Resolve the block path and level
+	path, level := ps.ResolveBlockPath(prefix)
+
+	// Build key from pre-extracted data (no second board scan)
+	keyBytes := pd.BuildBlockKeyAtLevel(level)
+	var blockKey BlockKey
+	copy(blockKey[:], keyBytes)
 
 	ps.dirtyMu.Lock()
 	defer ps.dirtyMu.Unlock()
 
-	// Get or create the dirty block for this filename
-	db := ps.dirtyBlocks[filename]
+	// Get or create the dirty block for this path
+	db := ps.dirtyBlocks[path]
 	if db == nil {
-		db = &dirtyBlock{records: make([]BlockRecord, 0, 64)}
-		ps.dirtyBlocks[filename] = db
-		ps.dirtyBytes += int64(len(filename)) + 50 // outer map entry overhead
+		db = &dirtyBlock{records: make([]BlockRecord, 0, 64), level: level}
+		ps.dirtyBlocks[path] = db
+		ps.dirtyBytes += int64(len(path)) + 50 // outer map entry overhead
 	}
 
 	// Append record with counts - merging happens at compact time
@@ -863,33 +705,48 @@ func (ps *PositionStore) Increment(pos graph.PositionKey, wins, draws, losses ui
 
 // getBlockFile retrieves a pack file from cache or disk
 func (ps *PositionStore) getBlockFile(filename string) (*psBlockCache, error) {
-	// Check cache first
+	// Check cache first (read-only, no LRU update for speed)
 	ps.cacheMu.RLock()
 	if elem, ok := ps.cache[filename]; ok {
+		block := elem.Value.(*psCacheEntry).block
 		ps.cacheMu.RUnlock()
-		ps.cacheMu.Lock()
-		ps.cacheList.MoveToFront(elem)
-		ps.cacheMu.Unlock()
-		return elem.Value.(*psCacheEntry).block, nil
+		return block, nil
 	}
 	ps.cacheMu.RUnlock()
 
-	// Load from disk
-	records, err := ps.loadBlockFile(filename)
+	// Use singleflight to prevent duplicate disk reads for the same block
+	result, err, _ := ps.blockLoadGroup.Do(filename, func() (interface{}, error) {
+		// Double-check cache (another goroutine might have loaded it)
+		ps.cacheMu.RLock()
+		if elem, ok := ps.cache[filename]; ok {
+			block := elem.Value.(*psCacheEntry).block
+			ps.cacheMu.RUnlock()
+			return block, nil
+		}
+		ps.cacheMu.RUnlock()
+
+		// Load from disk
+		records, err := ps.loadBlockFile(filename)
+		if err != nil {
+			return nil, err
+		}
+
+		pack := &psBlockCache{
+			filename: filename,
+			records:  records,
+		}
+
+		// Add to cache
+		ps.addToBlockCache(filename, pack)
+		ps.totalReads++
+
+		return pack, nil
+	})
+
 	if err != nil {
 		return nil, err
 	}
-
-	pack := &psBlockCache{
-		filename: filename,
-		records:  records,
-	}
-
-	// Add to cache
-	ps.addToBlockCache(filename, pack)
-	ps.totalReads++
-
-	return pack, nil
+	return result.(*psBlockCache), nil
 }
 
 // addToBlockCache adds a pack to the LRU cache
@@ -934,22 +791,32 @@ func (ps *PositionStore) invalidateBlockCache(filename string) {
 	}
 }
 
-// encodeBlockRecords encodes block records in columnar format
-// Layout: [wpawns×N×6][bpawns×N×6][pieces×N×20][wins×N×2][draws×N×2][losses×N×2][cp×N×2][dtm×N×2][dtz×N×2][provenDepth×N×2]
-// Total: 32*N + 14*N = 46*N bytes
-func encodeBlockRecords(records []BlockRecord) []byte {
+// encodeBlockRecordsAtLevel encodes records using V11 striped format for better compression.
+// V11 Layout: Keys striped by byte position, then data fields columnar
+// [keyByte0×N][keyByte1×N]...[keyByteK×N][wins×N×2][draws×N×2][losses×N×2][cp×N×2][dtm×N×2][dtz×N×2][provenDepth×N×2]
+func encodeBlockRecordsAtLevel(records []BlockRecord, level int) []byte {
 	n := len(records)
 	if n == 0 {
 		return nil
 	}
 
-	data := make([]byte, n*BlockRecordSize)
+	keySize := BlockKeySizeAtLevel(level)
+	recordSize := keySize + positionRecordSize
+	data := make([]byte, n*recordSize)
 
-	// Calculate column offsets
-	offWPawns := 0
-	offBPawns := offWPawns + n*6
-	offPieces := offBPawns + n*6
-	offWins := offPieces + n*20
+	// V11: Striped key layout - group by byte position for better compression
+	// Since keys are sorted, adjacent keys share prefixes, so same-position bytes
+	// across keys are often identical or similar
+	for b := 0; b < keySize; b++ {
+		off := b * n // Offset for this byte position
+		for i, rec := range records {
+			data[off+i] = rec.Key[b]
+		}
+	}
+
+	// Data columns (same as V10)
+	offData := n * keySize
+	offWins := offData
 	offDraws := offWins + n*2
 	offLosses := offDraws + n*2
 	offCP := offLosses + n*2
@@ -958,10 +825,43 @@ func encodeBlockRecords(records []BlockRecord) []byte {
 	offProvenDepth := offDTZ + n*2
 
 	for i, rec := range records {
-		// Key columns: [wpawns:6][bpawns:6][pieces:20]
-		copy(data[offWPawns+i*6:offWPawns+(i+1)*6], rec.Key[0:6])
-		copy(data[offBPawns+i*6:offBPawns+(i+1)*6], rec.Key[6:12])
-		copy(data[offPieces+i*20:offPieces+(i+1)*20], rec.Key[12:32])
+		binary.BigEndian.PutUint16(data[offWins+i*2:], rec.Data.Wins)
+		binary.BigEndian.PutUint16(data[offDraws+i*2:], rec.Data.Draws)
+		binary.BigEndian.PutUint16(data[offLosses+i*2:], rec.Data.Losses)
+		binary.BigEndian.PutUint16(data[offCP+i*2:], uint16(rec.Data.CP))
+		binary.BigEndian.PutUint16(data[offDTM+i*2:], uint16(rec.Data.DTM))
+		binary.BigEndian.PutUint16(data[offDTZ+i*2:], rec.Data.DTZ)
+		binary.BigEndian.PutUint16(data[offProvenDepth+i*2:], rec.Data.ProvenDepth)
+	}
+
+	return data
+}
+
+// encodeBlockRecordsAtLevelV10 encodes using V10 contiguous key format (for reference/testing)
+// V10 Layout: [keys×N×keySize][wins×N×2][draws×N×2][losses×N×2][cp×N×2][dtm×N×2][dtz×N×2][provenDepth×N×2]
+func encodeBlockRecordsAtLevelV10(records []BlockRecord, level int) []byte {
+	n := len(records)
+	if n == 0 {
+		return nil
+	}
+
+	keySize := BlockKeySizeAtLevel(level)
+	recordSize := keySize + positionRecordSize
+	data := make([]byte, n*recordSize)
+
+	// V10: Contiguous keys
+	offKeys := 0
+	offWins := n * keySize
+	offDraws := offWins + n*2
+	offLosses := offDraws + n*2
+	offCP := offLosses + n*2
+	offDTM := offCP + n*2
+	offDTZ := offDTM + n*2
+	offProvenDepth := offDTZ + n*2
+
+	for i, rec := range records {
+		// Write key bytes contiguously
+		copy(data[offKeys+i*keySize:offKeys+(i+1)*keySize], rec.Key[:keySize])
 
 		// Data columns
 		binary.BigEndian.PutUint16(data[offWins+i*2:], rec.Data.Wins)
@@ -976,20 +876,36 @@ func encodeBlockRecords(records []BlockRecord) []byte {
 	return data
 }
 
-// decodeBlockRecords decodes V7 columnar format into pack records
-func decodeBlockRecords(data []byte, n int) ([]BlockRecord, error) {
-	expectedSize := n * BlockRecordSize
+// decodeBlockRecordsAtLevel decodes block records based on format version
+func decodeBlockRecordsAtLevel(data []byte, n int, level int, version uint8) ([]BlockRecord, error) {
+	if version >= PSBlockVersionV11 {
+		return decodeBlockRecordsV11(data, n, level)
+	}
+	return decodeBlockRecordsV10(data, n, level)
+}
+
+// decodeBlockRecordsV11 decodes V11 striped key format
+func decodeBlockRecordsV11(data []byte, n int, level int) ([]BlockRecord, error) {
+	keySize := BlockKeySizeAtLevel(level)
+	recordSize := keySize + positionRecordSize
+	expectedSize := n * recordSize
 	if len(data) < expectedSize {
-		return nil, fmt.Errorf("data too short: got %d, need %d for %d records", len(data), expectedSize, n)
+		return nil, fmt.Errorf("data too short: got %d, need %d for %d records at level %d", len(data), expectedSize, n, level)
 	}
 
 	records := make([]BlockRecord, n)
 
-	// Calculate column offsets
-	offWPawns := 0
-	offBPawns := offWPawns + n*6
-	offPieces := offBPawns + n*6
-	offWins := offPieces + n*20
+	// V11: Keys striped by byte position
+	for b := 0; b < keySize; b++ {
+		off := b * n // Offset for this byte position
+		for i := 0; i < n; i++ {
+			records[i].Key[b] = data[off+i]
+		}
+	}
+
+	// Data columns (same as V10)
+	offData := n * keySize
+	offWins := offData
 	offDraws := offWins + n*2
 	offLosses := offDraws + n*2
 	offCP := offLosses + n*2
@@ -998,10 +914,42 @@ func decodeBlockRecords(data []byte, n int) ([]BlockRecord, error) {
 	offProvenDepth := offDTZ + n*2
 
 	for i := 0; i < n; i++ {
-		// Key columns: [wpawns:6][bpawns:6][pieces:20]
-		copy(records[i].Key[0:6], data[offWPawns+i*6:offWPawns+(i+1)*6])
-		copy(records[i].Key[6:12], data[offBPawns+i*6:offBPawns+(i+1)*6])
-		copy(records[i].Key[12:32], data[offPieces+i*20:offPieces+(i+1)*20])
+		records[i].Data.Wins = binary.BigEndian.Uint16(data[offWins+i*2:])
+		records[i].Data.Draws = binary.BigEndian.Uint16(data[offDraws+i*2:])
+		records[i].Data.Losses = binary.BigEndian.Uint16(data[offLosses+i*2:])
+		records[i].Data.CP = int16(binary.BigEndian.Uint16(data[offCP+i*2:]))
+		records[i].Data.DTM = int16(binary.BigEndian.Uint16(data[offDTM+i*2:]))
+		records[i].Data.DTZ = binary.BigEndian.Uint16(data[offDTZ+i*2:])
+		records[i].Data.ProvenDepth = binary.BigEndian.Uint16(data[offProvenDepth+i*2:])
+	}
+
+	return records, nil
+}
+
+// decodeBlockRecordsV10 decodes V10 contiguous key format
+func decodeBlockRecordsV10(data []byte, n int, level int) ([]BlockRecord, error) {
+	keySize := BlockKeySizeAtLevel(level)
+	recordSize := keySize + positionRecordSize
+	expectedSize := n * recordSize
+	if len(data) < expectedSize {
+		return nil, fmt.Errorf("data too short: got %d, need %d for %d records at level %d", len(data), expectedSize, n, level)
+	}
+
+	records := make([]BlockRecord, n)
+
+	// V10: Contiguous keys
+	offKeys := 0
+	offWins := n * keySize
+	offDraws := offWins + n*2
+	offLosses := offDraws + n*2
+	offCP := offLosses + n*2
+	offDTM := offCP + n*2
+	offDTZ := offDTM + n*2
+	offProvenDepth := offDTZ + n*2
+
+	for i := 0; i < n; i++ {
+		// Read key bytes contiguously
+		copy(records[i].Key[:keySize], data[offKeys+i*keySize:offKeys+(i+1)*keySize])
 
 		// Data columns
 		records[i].Data.Wins = binary.BigEndian.Uint16(data[offWins+i*2:])
@@ -1016,12 +964,13 @@ func decodeBlockRecords(data []byte, n int) ([]BlockRecord, error) {
 	return records, nil
 }
 
-// BlockHeader is the header for block files
-// 16 bytes: [Magic:4][Version:1][Flags:1][RecordCount:4][Checksum:4][Reserved:2]
+// BlockHeader is the header for block files (V9)
+// 17 bytes: [Magic:4][Version:1][Flags:1][Level:1][RecordCount:4][Checksum:4][Reserved:2]
 type BlockHeader struct {
 	Magic       [4]byte
 	Version     uint8
 	Flags       uint8
+	Level       uint8 // Block level (1-7)
 	RecordCount uint32
 	Checksum    uint32
 	Reserved    uint16
@@ -1032,9 +981,10 @@ func encodeBlockHeader(h BlockHeader) []byte {
 	copy(buf[0:4], h.Magic[:])
 	buf[4] = h.Version
 	buf[5] = h.Flags
-	binary.BigEndian.PutUint32(buf[6:10], h.RecordCount)
-	binary.BigEndian.PutUint32(buf[10:14], h.Checksum)
-	binary.BigEndian.PutUint16(buf[14:16], h.Reserved)
+	buf[6] = h.Level
+	binary.BigEndian.PutUint32(buf[7:11], h.RecordCount)
+	binary.BigEndian.PutUint32(buf[11:15], h.Checksum)
+	binary.BigEndian.PutUint16(buf[15:17], h.Reserved)
 	return buf
 }
 
@@ -1046,15 +996,23 @@ func decodeBlockHeader(data []byte) (BlockHeader, error) {
 	copy(h.Magic[:], data[0:4])
 	h.Version = data[4]
 	h.Flags = data[5]
-	h.RecordCount = binary.BigEndian.Uint32(data[6:10])
-	h.Checksum = binary.BigEndian.Uint32(data[10:14])
-	h.Reserved = binary.BigEndian.Uint16(data[14:16])
+	h.Level = data[6]
+	h.RecordCount = binary.BigEndian.Uint32(data[7:11])
+	h.Checksum = binary.BigEndian.Uint32(data[11:15])
+	h.Reserved = binary.BigEndian.Uint16(data[15:17])
+	// Note: level 0 is valid for V9+ _rest.block files
+	// Caller should handle version-based defaulting in loadBlockFile
 	return h, nil
 }
 
-// writeBlockFile writes a pack file to disk
-func (ps *PositionStore) writeBlockFile(filename string, records []BlockRecord) (int64, error) {
-	fullPath := filepath.Join(ps.dir, filename)
+// writeBlockFileAtLevel writes a block file to disk at a specific level
+func (ps *PositionStore) writeBlockFileAtLevel(path string, records []BlockRecord, level int) (int64, error) {
+	fullPath := filepath.Join(ps.dir, path)
+
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return 0, fmt.Errorf("create directory: %w", err)
+	}
 
 	// Count positions for metadata
 	var totalPositions, evalPositions, cpPositions, dtmPositions, dtzPositions uint64
@@ -1079,17 +1037,20 @@ func (ps *PositionStore) writeBlockFile(filename string, records []BlockRecord) 
 
 	// Try to read old file for delta calculation
 	var oldTotal, oldEval, oldCP, oldDTM, oldDTZ uint64
-	var oldCompressedSize uint64
+	var oldCompressedSize, oldUncompressedSize uint64
+	var oldLevel int = level
 	isNewFile := true
 	if oldData, err := os.ReadFile(fullPath); err == nil {
 		isNewFile = false
 		oldCompressedSize = uint64(len(oldData))
 		if decompressed, err := ps.decoder.DecodeAll(oldData, nil); err == nil {
+			oldUncompressedSize = uint64(len(decompressed))
 			if len(decompressed) >= PSBlockHeaderSize && string(decompressed[0:4]) == PSBlockMagic {
 				if header, err := decodeBlockHeader(decompressed); err == nil {
 					oldTotal = uint64(header.RecordCount)
+					oldLevel = int(header.Level)
 					// Decode old records to count their stats
-					if oldRecords, err := decodeBlockRecords(decompressed[PSBlockHeaderSize:], int(header.RecordCount)); err == nil {
+					if oldRecords, err := decodeBlockRecordsAtLevel(decompressed[PSBlockHeaderSize:], int(header.RecordCount), oldLevel, header.Version); err == nil {
 						for _, rec := range oldRecords {
 							if rec.Data.HasCP() {
 								oldCP++
@@ -1110,13 +1071,14 @@ func (ps *PositionStore) writeBlockFile(filename string, records []BlockRecord) 
 		}
 	}
 
-	// Encode records in columnar format
-	recordData := encodeBlockRecords(records)
+	// Encode records in columnar format for this level
+	recordData := encodeBlockRecordsAtLevel(records, level)
 
 	// Build header
 	header := BlockHeader{
 		Version:     PSBlockVersion,
 		Flags:       0,
+		Level:       uint8(level),
 		RecordCount: uint32(len(records)),
 		Checksum:    crc32.ChecksumIEEE(recordData),
 		Reserved:    0,
@@ -1141,7 +1103,7 @@ func (ps *PositionStore) writeBlockFile(filename string, records []BlockRecord) 
 	ps.meta.DTMPositions = ps.meta.DTMPositions - oldDTM + dtmPositions
 	ps.meta.DTZPositions = ps.meta.DTZPositions - oldDTZ + dtzPositions
 	ps.meta.CompressedBytes = ps.meta.CompressedBytes - oldCompressedSize + compressedSize
-	ps.meta.UncompressedBytes = ps.meta.UncompressedBytes + uncompressedSize // simplified
+	ps.meta.UncompressedBytes = ps.meta.UncompressedBytes - oldUncompressedSize + uncompressedSize
 	if isNewFile {
 		ps.meta.TotalBlocks++
 	}
@@ -1156,6 +1118,74 @@ func (ps *PositionStore) writeBlockFile(filename string, records []BlockRecord) 
 		return 0, err
 	}
 	return int64(len(compressed)), nil
+}
+
+// subtractBlockMetadata reads a block file and subtracts its metadata counts from global metadata.
+// This is used when splitting a block - the parent's counts must be removed before children add them.
+func (ps *PositionStore) subtractBlockMetadata(fullPath string) {
+	ps.fileMu.RLock()
+	oldData, err := os.ReadFile(fullPath)
+	ps.fileMu.RUnlock()
+	if err != nil {
+		// File doesn't exist - nothing to subtract
+		return
+	}
+
+	oldCompressedSize := uint64(len(oldData))
+
+	decompressed, err := ps.decoder.DecodeAll(oldData, nil)
+	if err != nil {
+		return
+	}
+	oldUncompressedSize := uint64(len(decompressed))
+
+	if len(decompressed) < PSBlockHeaderSize || string(decompressed[0:4]) != PSBlockMagic {
+		return
+	}
+
+	header, err := decodeBlockHeader(decompressed)
+	if err != nil {
+		return
+	}
+
+	oldLevel := int(header.Level)
+	oldRecords, err := decodeBlockRecordsAtLevel(decompressed[PSBlockHeaderSize:], int(header.RecordCount), oldLevel, header.Version)
+	if err != nil {
+		return
+	}
+
+	// Count stats from old records
+	var oldTotal, oldEval, oldCP, oldDTM, oldDTZ uint64
+	oldTotal = uint64(len(oldRecords))
+	for _, rec := range oldRecords {
+		hasCP := rec.Data.HasCP()
+		hasDTM := rec.Data.DTM != DTMUnknown
+		hasDTZ := rec.Data.DTZ != 0
+		if hasCP {
+			oldCP++
+		}
+		if hasDTM {
+			oldDTM++
+		}
+		if hasDTZ {
+			oldDTZ++
+		}
+		if hasCP || hasDTM || hasDTZ {
+			oldEval++
+		}
+	}
+
+	// Subtract from global metadata
+	ps.metaMu.Lock()
+	ps.meta.TotalPositions -= oldTotal
+	ps.meta.EvaluatedPositions -= oldEval
+	ps.meta.CPPositions -= oldCP
+	ps.meta.DTMPositions -= oldDTM
+	ps.meta.DTZPositions -= oldDTZ
+	ps.meta.CompressedBytes -= oldCompressedSize
+	ps.meta.UncompressedBytes -= oldUncompressedSize
+	ps.meta.TotalBlocks-- // Parent block is being removed
+	ps.metaMu.Unlock()
 }
 
 // loadBlockFile loads a pack file from disk
@@ -1194,8 +1224,9 @@ func (ps *PositionStore) loadBlockFile(filename string) ([]BlockRecord, error) {
 		ps.log("warning: checksum mismatch in %s (got %x, expected %x)", filename, checksum, header.Checksum)
 	}
 
-	// Decode records
-	records, err := decodeBlockRecords(recordData, int(header.RecordCount))
+	// Decode records using level and version from header
+	level := int(header.Level)
+	records, err := decodeBlockRecordsAtLevel(recordData, int(header.RecordCount), level, header.Version)
 	if err != nil {
 		return nil, fmt.Errorf("decode pack records: %w", err)
 	}
@@ -1220,13 +1251,42 @@ func (ps *PositionStore) FlushAll() error {
 	ps.flushRunning = true
 	ps.flushMu.Unlock()
 
-	err := ps.flushAllInternal(true)
+	// Loop until all dirty blocks are flushed.
+	// Redistribution during flush can create new dirty blocks that need another pass.
+	maxPasses := 10 // safety limit to prevent infinite loops
+	for pass := 0; pass < maxPasses; pass++ {
+		err := ps.flushAllInternal(true)
+		if err != nil {
+			ps.flushMu.Lock()
+			ps.flushRunning = false
+			ps.flushMu.Unlock()
+			return err
+		}
+
+		// Check if redistribution created new dirty blocks
+		if ps.DirtyCount() == 0 {
+			break
+		}
+		ps.log("redistribution created new dirty blocks, running additional flush pass %d...", pass+2)
+	}
 
 	ps.flushMu.Lock()
 	ps.flushRunning = false
 	ps.flushMu.Unlock()
 
-	return err
+	// Flush pending evals to CSV log
+	if err := ps.flushEvalLog(); err != nil {
+		ps.log("warning: eval log flush failed: %v", err)
+	}
+
+	// Small root blocks are fine; they'll be read individually.
+
+	// Refresh metadata from disk to fix any accumulated tracking errors
+	if rerr := ps.RefreshMeta(); rerr != nil {
+		ps.log("warning: metadata refresh failed: %v", rerr)
+	}
+
+	return nil
 }
 
 // FlushAllAsync starts a background flush if one isn't already running.
@@ -1262,17 +1322,61 @@ func (ps *PositionStore) WaitForFlush() {
 	}
 }
 
+// flushEvalLog writes pending eval entries to the CSV log file
+func (ps *PositionStore) flushEvalLog() error {
+	if ps.evalLogPath == "" {
+		return nil
+	}
+
+	// Atomically swap out pending evals
+	ps.pendingEvalsMu.Lock()
+	evals := ps.pendingEvals
+	ps.pendingEvals = nil
+	ps.pendingEvalsMu.Unlock()
+
+	if len(evals) == 0 {
+		return nil
+	}
+
+	// Open file in append mode
+	f, err := os.OpenFile(ps.evalLogPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("open eval log: %w", err)
+	}
+	defer f.Close()
+
+	// Write each eval entry as a CSV row
+	for _, e := range evals {
+		// Format: fen,position,cp,dtm,dtz,proven_depth
+		fen := e.pos.ToFEN()
+		posKey := e.pos.String()
+		line := fmt.Sprintf("%s,%s,%d,%d,%d,%d\n",
+			fen, posKey, e.record.CP, e.record.DTM, e.record.DTZ, e.record.ProvenDepth)
+		if _, err := f.WriteString(line); err != nil {
+			return fmt.Errorf("write eval log: %w", err)
+		}
+	}
+
+	ps.log("flushed %d evals to %s", len(evals), ps.evalLogPath)
+	return nil
+}
+
 func (ps *PositionStore) flushAllInternal(blocking bool) error {
 	// Collect filenames with their sizes for sorting
 	type fileWithSize struct {
-		filename string
-		size     int
+		filename      string
+		size          int
+		estimatedSize int64 // estimated uncompressed bytes
 	}
 
 	ps.dirtyMu.Lock()
 	files := make([]fileWithSize, 0, len(ps.dirtyBlocks))
 	for filename, db := range ps.dirtyBlocks {
-		files = append(files, fileWithSize{filename: filename, size: len(db.records)})
+		// Calculate estimated size based on record count and level
+		_, level, _ := ParseBlockFilePath(filename)
+		recordSize := BlockRecordSizeAtLevel(level)
+		estimatedSize := int64(len(db.records)*recordSize + PSBlockHeaderSize)
+		files = append(files, fileWithSize{filename: filename, size: len(db.records), estimatedSize: estimatedSize})
 	}
 	ps.dirtyMu.Unlock()
 
@@ -1282,8 +1386,10 @@ func (ps *PositionStore) flushAllInternal(blocking bool) error {
 	})
 
 	dirtyFilenames := make([]string, len(files))
+	var totalEstimatedBytes int64
 	for i, f := range files {
 		dirtyFilenames[i] = f.filename
+		totalEstimatedBytes += f.estimatedSize
 	}
 
 	if len(dirtyFilenames) == 0 {
@@ -1304,7 +1410,8 @@ func (ps *PositionStore) flushAllInternal(blocking bool) error {
 
 	// Progress tracking
 	var flushed int64
-	var bytesWritten int64
+	var compressedWritten int64
+	var uncompressedWritten int64
 
 	// Create work channel and error channel
 	filenameChan := make(chan string, len(dirtyFilenames))
@@ -1321,11 +1428,19 @@ func (ps *PositionStore) flushAllInternal(blocking bool) error {
 				return
 			case <-ticker.C:
 				f := atomic.LoadInt64(&flushed)
-				b := atomic.LoadInt64(&bytesWritten)
+				compressed := atomic.LoadInt64(&compressedWritten)
+				uncompressed := atomic.LoadInt64(&uncompressedWritten)
 				elapsed := time.Since(start)
 				rate := float64(f) / elapsed.Seconds()
-				ps.log("flush progress: %d/%d blocks (%.1f%%), %.1f MB written, %.1f blocks/sec",
-					f, total, float64(f)/float64(total)*100, float64(b)/(1024*1024), rate)
+				uncompressedPct := float64(0)
+				if totalEstimatedBytes > 0 {
+					uncompressedPct = float64(uncompressed) / float64(totalEstimatedBytes) * 100
+				}
+				ps.log("flush progress: %d/%d blocks (%.1f%%), %.1f/%.1f MB uncompressed (%.1f%%), %.1f MB compressed, %.1f blocks/sec",
+					f, total, float64(f)/float64(total)*100,
+					float64(uncompressed)/(1024*1024), float64(totalEstimatedBytes)/(1024*1024), uncompressedPct,
+					float64(compressed)/(1024*1024),
+					rate)
 			}
 		}
 	}()
@@ -1337,7 +1452,7 @@ func (ps *PositionStore) flushAllInternal(blocking bool) error {
 		go func() {
 			defer wg.Done()
 			for filename := range filenameChan {
-				written, err := ps.flushBlockFileWithSize(filename)
+				compressed, uncompressed, err := ps.flushBlockFileWithSize(filename)
 				if err != nil {
 					select {
 					case errChan <- fmt.Errorf("flush %s: %w", filename, err):
@@ -1346,7 +1461,8 @@ func (ps *PositionStore) flushAllInternal(blocking bool) error {
 					return
 				}
 				atomic.AddInt64(&flushed, 1)
-				atomic.AddInt64(&bytesWritten, written)
+				atomic.AddInt64(&compressedWritten, compressed)
+				atomic.AddInt64(&uncompressedWritten, uncompressed)
 			}
 		}()
 	}
@@ -1368,8 +1484,8 @@ func (ps *PositionStore) flushAllInternal(blocking bool) error {
 	}
 
 	elapsed := time.Since(start)
-	ps.log("flush complete: %d blocks, %.1f MB written in %v (%.1f blocks/sec)",
-		total, float64(bytesWritten)/(1024*1024), elapsed, float64(total)/elapsed.Seconds())
+	ps.log("flush complete: %d blocks, %.1f MB uncompressed, %.1f MB compressed in %v (%.1f blocks/sec)",
+		total, float64(uncompressedWritten)/(1024*1024), float64(compressedWritten)/(1024*1024), elapsed, float64(total)/elapsed.Seconds())
 	return nil
 }
 
@@ -1438,173 +1554,21 @@ func (ps *PositionStore) IncrementGameCount(n uint64) {
 	ps.metaMu.Unlock()
 }
 
-// DirtyPackCount returns the number of pack files with pending writes
-func (ps *PositionStore) DirtyPackCount() int {
-	ps.dirtyMu.Lock()
-	count := len(ps.dirtyBlocks)
-	ps.dirtyMu.Unlock()
-	return count
-}
-
-// FlushAllV7 writes all dirty pack files to disk using parallel workers
-func (ps *PositionStore) FlushAllV7() error {
-	ps.WaitForFlush()
-
-	ps.flushMu.Lock()
-	if ps.flushRunning {
-		ps.flushMu.Unlock()
-		ps.WaitForFlush()
-		return ps.FlushAllV7()
-	}
-	ps.flushRunning = true
-	ps.flushMu.Unlock()
-
-	err := ps.flushAllV7Internal()
-
-	ps.flushMu.Lock()
-	ps.flushRunning = false
-	ps.flushMu.Unlock()
-
-	return err
-}
-
-// FlushAllV7Async starts a background flush of pack files
-func (ps *PositionStore) FlushAllV7Async() {
-	ps.flushMu.Lock()
-	if ps.flushRunning {
-		ps.flushMu.Unlock()
-		return
-	}
-	ps.flushRunning = true
-	ps.flushMu.Unlock()
-
-	go func() {
-		ps.flushAllV7Internal()
-		ps.flushMu.Lock()
-		ps.flushRunning = false
-		ps.flushMu.Unlock()
-	}()
-}
-
-func (ps *PositionStore) flushAllV7Internal() error {
-	// Collect filenames with their sizes for sorting
-	type fileWithSize struct {
-		filename string
-		size     int
-	}
-
-	ps.dirtyMu.Lock()
-	files := make([]fileWithSize, 0, len(ps.dirtyBlocks))
-	for filename, db := range ps.dirtyBlocks {
-		files = append(files, fileWithSize{filename: filename, size: len(db.records)})
-	}
-	ps.dirtyMu.Unlock()
-
-	if len(files) == 0 {
-		return nil
-	}
-
-	// Sort by size descending - largest blocks first so they start processing early
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].size > files[j].size
-	})
-
-	dirtyFilenames := make([]string, len(files))
-	for i, f := range files {
-		dirtyFilenames[i] = f.filename
-	}
-
-	numWorkers := runtime.NumCPU()
-	if numWorkers > len(dirtyFilenames) {
-		numWorkers = len(dirtyFilenames)
-	}
-	if numWorkers > 16 {
-		numWorkers = 16
-	}
-
-	total := len(dirtyFilenames)
-	ps.log("flushing %d dirty pack files with %d workers...", total, numWorkers)
-	start := time.Now()
-
-	var flushed int64
-	var bytesWritten int64
-
-	filenameChan := make(chan string, len(dirtyFilenames))
-	errChan := make(chan error, numWorkers)
-
-	// Progress logger
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				f := atomic.LoadInt64(&flushed)
-				b := atomic.LoadInt64(&bytesWritten)
-				elapsed := time.Since(start)
-				rate := float64(f) / elapsed.Seconds()
-				ps.log("flush progress: %d/%d packs (%.1f%%), %.1f MB written, %.1f packs/sec",
-					f, total, float64(f)/float64(total)*100, float64(b)/(1024*1024), rate)
-			}
-		}
-	}()
-
-	// Start workers
-	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for filename := range filenameChan {
-				written, err := ps.flushBlockFileWithSize(filename)
-				if err != nil {
-					select {
-					case errChan <- fmt.Errorf("flush %s: %w", filename, err):
-					default:
-					}
-					return
-				}
-				atomic.AddInt64(&flushed, 1)
-				atomic.AddInt64(&bytesWritten, written)
-			}
-		}()
-	}
-
-	// Send work
-	for _, filename := range dirtyFilenames {
-		filenameChan <- filename
-	}
-	close(filenameChan)
-
-	wg.Wait()
-	close(errChan)
-	close(done)
-
-	if err := <-errChan; err != nil {
-		return err
-	}
-
-	elapsed := time.Since(start)
-	ps.log("flush complete: %d packs, %.1f MB written in %v (%.1f packs/sec)",
-		total, float64(bytesWritten)/(1024*1024), elapsed, float64(total)/elapsed.Seconds())
-	return nil
-}
-
-// flushBlockFileWithSize flushes a single pack file and returns bytes written
-func (ps *PositionStore) flushBlockFileWithSize(filename string) (int64, error) {
+// flushBlockFileWithSize flushes a single pack file and returns (compressed, uncompressed) bytes written
+func (ps *PositionStore) flushBlockFileWithSize(filename string) (int64, int64, error) {
 	ps.dirtyMu.Lock()
 	db, ok := ps.dirtyBlocks[filename]
 	if !ok || len(db.records) == 0 {
 		ps.dirtyMu.Unlock()
-		return 0, nil
+		return 0, 0, nil
 	}
 	// Compact to merge duplicates and sort
 	db.compact()
 	// Move to inflight so Get() can still find these records during flush
 	newRecords := db.records
+	level := db.level // Save level before deleting
+	// Calculate uncompressed size from record count and level
+	uncompressedSize := int64(len(newRecords)*BlockRecordSizeAtLevel(level) + PSBlockHeaderSize)
 	ps.inflightBlocks[filename] = newRecords
 	// Subtract memory for flushed records
 	ps.dirtyBytes -= int64(len(newRecords)) * DirtyEntrySize
@@ -1625,7 +1589,199 @@ func (ps *PositionStore) flushBlockFileWithSize(filename string) (int64, error) 
 	// Invalidate cache
 	ps.invalidateBlockCache(filename)
 
+	// Check if the path has been split (directory exists where file should be)
+	// This can happen if another goroutine split the block between Put() and flush
+	dirPath := strings.TrimSuffix(filepath.Join(ps.dir, filename), ".block")
+	if info, err := os.Stat(dirPath); err == nil && info.IsDir() {
+		// Block was split! Redistribute records to correct child paths
+		ps.log("flush detected split: redistributing %d records from %s to children", len(newRecords), filename)
+		compressed, err := ps.redistributeToChildren(newRecords, level, filename)
+		return compressed, uncompressedSize, err
+	}
+
 	// Try to load existing records
+	var existingRecords []BlockRecord
+	existing, err := ps.loadBlockFile(filename)
+	if err == nil {
+		existingRecords = existing
+	} else if !os.IsNotExist(err) {
+		return 0, 0, fmt.Errorf("load existing: %w", err)
+	}
+
+	// newRecords already sorted from compact()
+	// Merge (use key size for proper comparison)
+	keySize := BlockKeySizeAtLevel(level)
+
+	// Count evals before merge for debugging
+	var existingEvals, newEvals int
+	for _, rec := range existingRecords {
+		if rec.Data.HasCP() || rec.Data.DTM != DTMUnknown || rec.Data.DTZ != 0 {
+			existingEvals++
+		}
+	}
+	for _, rec := range newRecords {
+		if rec.Data.HasCP() || rec.Data.DTM != DTMUnknown || rec.Data.DTZ != 0 {
+			newEvals++
+		}
+	}
+
+	merged := mergeBlockRecords(existingRecords, newRecords, keySize)
+
+	// Count evals after merge
+	var mergedEvals int
+	for _, rec := range merged {
+		if rec.Data.HasCP() || rec.Data.DTM != DTMUnknown || rec.Data.DTZ != 0 {
+			mergedEvals++
+		}
+	}
+
+	// Log if evals were lost during merge
+	if existingEvals > 0 && mergedEvals < existingEvals {
+		ps.log("WARNING: evals lost in flush merge for %s: existing=%d, new=%d, merged=%d",
+			filename, existingEvals, newEvals, mergedEvals)
+	}
+
+	// Check if block needs to be split BEFORE writing (in-memory splitting)
+	// This avoids write-read-split-rewrite cycle
+	recordSize := BlockRecordSizeAtLevel(level)
+	estimatedSize := uint64(len(merged)*recordSize + PSBlockHeaderSize)
+	if estimatedSize > ps.maxBlockSizeBytes && level < MaxBlockLevel {
+		// Split in memory and write directly to child blocks
+		compressed, err := ps.splitAndFlushInMemory(filename, merged, level)
+		return compressed, uncompressedSize, err
+	}
+
+	// Block is under threshold, write directly
+	written, err := ps.writeBlockFileAtLevel(filename, merged, level)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Update cache
+	ps.addToBlockCache(filename, &psBlockCache{
+		filename: filename,
+		records:  merged,
+		level:    level,
+	})
+
+	return written, uncompressedSize, nil
+}
+
+// splitAndFlushInMemory partitions records by first key byte and writes directly to child blocks.
+// V10: Unified splitting - all levels split by first byte, shifting 1 byte at a time.
+func (ps *PositionStore) splitAndFlushInMemory(filename string, records []BlockRecord, level int) (int64, error) {
+	if level >= MaxBlockLevel {
+		// Can't split at max level, just write
+		return ps.writeBlockFileAtLevel(filename, records, level)
+	}
+
+	keySize := BlockKeySizeAtLevel(level)
+	childLevel := level + 1
+	childKeySize := BlockKeySizeAtLevel(childLevel)
+
+	// V10: Unified - always shift 1 byte per level
+	const shiftBytes = 1
+
+	// Parent directory (path without .block extension)
+	parentDir := strings.TrimSuffix(filename, ".block")
+
+	// Count evals in records being split
+	var evalCount int
+	for _, rec := range records {
+		if rec.Data.HasCP() || rec.Data.DTM != DTMUnknown || rec.Data.DTZ != 0 {
+			evalCount++
+		}
+	}
+	ps.log("in-memory split: %s (level %d, %d records, %d evals) -> children at level %d",
+		filename, level, len(records), evalCount, childLevel)
+
+	// CRITICAL: Before deleting parent file, subtract its metadata counts.
+	// The parent's positions are already counted in global metadata.
+	// Children will add them as new (since no old child files exist).
+	// Without this subtraction, positions get double-counted.
+	parentFile := filepath.Join(ps.dir, filename)
+	ps.subtractBlockMetadata(parentFile)
+
+	// Delete parent file - data is in memory, children will be written
+	if err := os.Remove(parentFile); err != nil && !os.IsNotExist(err) {
+		ps.log("warning: failed to remove parent before split: %v", err)
+	}
+
+	// CRITICAL: Invalidate path cache since file structure changed.
+	// Without this, cached paths point to the old parent file which no longer exists,
+	// causing reads to fail and data to appear "lost".
+	ps.InvalidatePathCache()
+
+	// V10: All levels use the same uniform split logic - group by first byte
+	return ps.splitByFirstByteInMemory(parentDir, records, keySize, childKeySize, shiftBytes, childLevel)
+}
+
+// splitByFirstByteInMemory is the V10 unified split function.
+// All levels split by first key byte, creating 256 possible children.
+func (ps *PositionStore) splitByFirstByteInMemory(parentDir string, records []BlockRecord, keySize, childKeySize, shiftBytes, childLevel int) (int64, error) {
+	// Group by first byte
+	byteGroups := make([][]BlockRecord, 256)
+	for i := range byteGroups {
+		byteGroups[i] = make([]BlockRecord, 0)
+	}
+	for _, rec := range records {
+		firstByte := rec.Key[0]
+		byteGroups[firstByte] = append(byteGroups[firstByte], rec)
+	}
+
+	// Create parent directory
+	fullParentDir := filepath.Join(ps.dir, parentDir)
+	if err := os.MkdirAll(fullParentDir, 0755); err != nil {
+		return 0, fmt.Errorf("create split dir: %w", err)
+	}
+
+	var totalWritten int64
+
+	// Write individual files for each byte value
+	for byteVal := 0; byteVal < 256; byteVal++ {
+		if len(byteGroups[byteVal]) == 0 {
+			continue
+		}
+
+		childName := fmt.Sprintf("%02x", byteVal)
+		childPath := filepath.Join(parentDir, childName+".block")
+
+		// Create shifted records (shift 1 byte)
+		childRecords := make([]BlockRecord, len(byteGroups[byteVal]))
+		for i, rec := range byteGroups[byteVal] {
+			childRecords[i] = BlockRecord{Data: rec.Data}
+			copy(childRecords[i].Key[:], rec.Key[shiftBytes:keySize])
+		}
+
+		// Sort for merge
+		sort.Slice(childRecords, func(i, j int) bool {
+			return bytes.Compare(childRecords[i].Key[:childKeySize], childRecords[j].Key[:childKeySize]) < 0
+		})
+
+		// Recursively flush (may split further if still too large)
+		written, err := ps.flushRecordsToPath(childPath, childRecords, childLevel)
+		if err != nil {
+			return totalWritten, fmt.Errorf("flush child %s: %w", childPath, err)
+		}
+		totalWritten += written
+	}
+
+	return totalWritten, nil
+}
+
+// flushRecordsToPath writes records to a path, merging with existing data and splitting if needed
+func (ps *PositionStore) flushRecordsToPath(filename string, newRecords []BlockRecord, level int) (int64, error) {
+	// Invalidate cache
+	ps.invalidateBlockCache(filename)
+
+	// Check if the path has been split (directory exists where file should be)
+	dirPath := strings.TrimSuffix(filepath.Join(ps.dir, filename), ".block")
+	if info, err := os.Stat(dirPath); err == nil && info.IsDir() {
+		// Already split, redistribute to children
+		return ps.redistributeToChildren(newRecords, level, filename)
+	}
+
+	// Load existing records
 	var existingRecords []BlockRecord
 	existing, err := ps.loadBlockFile(filename)
 	if err == nil {
@@ -1634,12 +1790,20 @@ func (ps *PositionStore) flushBlockFileWithSize(filename string) (int64, error) 
 		return 0, fmt.Errorf("load existing: %w", err)
 	}
 
-	// newRecords already sorted from compact()
 	// Merge
-	merged := mergeBlockRecords(existingRecords, newRecords)
+	keySize := BlockKeySizeAtLevel(level)
+	merged := mergeBlockRecords(existingRecords, newRecords, keySize)
 
-	// Write
-	written, err := ps.writeBlockFile(filename, merged)
+	// Check if we need to split
+	recordSize := BlockRecordSizeAtLevel(level)
+	estimatedSize := uint64(len(merged)*recordSize + PSBlockHeaderSize)
+	if estimatedSize > ps.maxBlockSizeBytes && level < MaxBlockLevel {
+		// Recursively split in memory
+		return ps.splitAndFlushInMemory(filename, merged, level)
+	}
+
+	// Write directly
+	written, err := ps.writeBlockFileAtLevel(filename, merged, level)
 	if err != nil {
 		return 0, err
 	}
@@ -1648,13 +1812,70 @@ func (ps *PositionStore) flushBlockFileWithSize(filename string) (int64, error) 
 	ps.addToBlockCache(filename, &psBlockCache{
 		filename: filename,
 		records:  merged,
+		level:    level,
 	})
 
 	return written, nil
 }
 
+// redistributeToChildren handles the case where a dirty block's target path
+// was split by another goroutine. It redistributes the records to the correct
+// child paths based on the new level structure.
+// V10: Unified logic - always shift 1 byte per level
+func (ps *PositionStore) redistributeToChildren(records []BlockRecord, level int, oldPath string) (int64, error) {
+	if level >= MaxBlockLevel {
+		// Can't redistribute at max level
+		ps.log("warning: cannot redistribute at max level %d for %s", level, oldPath)
+		return 0, nil
+	}
+
+	childLevel := level + 1
+
+	// V10: Always shift 1 byte
+	const shiftBytes = 1
+
+	// Group records by child path
+	childRecords := make(map[string][]BlockRecord)
+	parentDir := strings.TrimSuffix(oldPath, ".block")
+
+	for _, rec := range records {
+		// V10: All levels use uniform 2-hex-char naming based on first byte
+		firstByte := rec.Key[0]
+		childName := fmt.Sprintf("%02x", firstByte)
+		childPath := filepath.Join(parentDir, childName+".block")
+
+		// Create child record with shifted key
+		childRec := BlockRecord{Data: rec.Data}
+		copy(childRec.Key[:], rec.Key[shiftBytes:])
+
+		childRecords[childPath] = append(childRecords[childPath], childRec)
+	}
+
+	// Put records into dirty blocks for each child path
+	ps.dirtyMu.Lock()
+	for childPath, recs := range childRecords {
+		db := ps.dirtyBlocks[childPath]
+		if db == nil {
+			db = &dirtyBlock{records: make([]BlockRecord, 0, len(recs)), level: childLevel}
+			ps.dirtyBlocks[childPath] = db
+			ps.dirtyBytes += int64(len(childPath)) + 50
+		}
+		for _, rec := range recs {
+			db.append(rec)
+			ps.dirtyBytes += DirtyEntrySize
+		}
+	}
+	ps.dirtyMu.Unlock()
+
+	ps.log("redistributed %d records from %s to %d child paths at level %d",
+		len(records), oldPath, len(childRecords), childLevel)
+
+	return 0, nil // No bytes written directly; records will be flushed later
+}
+
 // mergeBlockRecords merges two sorted pack record slices
-func mergeBlockRecords(existing, newer []BlockRecord) []BlockRecord {
+// keySize determines how many bytes of the key to compare
+func mergeBlockRecords(existing, newer []BlockRecord, keySize int) []BlockRecord {
 	if len(existing) == 0 {
 		return newer
 	}
@@ -1666,7 +1887,7 @@ func mergeBlockRecords(existing, newer []BlockRecord) []BlockRecord {
 	i, j := 0, 0
 
 	for i < len(existing) && j < len(newer) {
-		cmp := bytes.Compare(existing[i].Key[:], newer[j].Key[:])
+		cmp := bytes.Compare(existing[i].Key[:keySize], newer[j].Key[:keySize])
 		if cmp < 0 {
 			result = append(result, existing[i])
 			i++
@@ -1676,23 +1897,22 @@ func mergeBlockRecords(existing, newer []BlockRecord) []BlockRecord {
 		} else {
 			// Same key: merge by adding counts and keeping best eval data
 			merged := existing[i].Data
-			// Add counts with overflow protection (accumulative merge for ingest)
-			newWins := uint32(merged.Wins) + uint32(newer[j].Data.Wins)
-			if newWins > 65535 {
-				merged.Wins = 65535
-			} else {
+			// Skip count updates if any field is already saturated (preserves ratios)
+			if merged.Wins < 65535 && merged.Draws < 65535 && merged.Losses < 65535 {
+				newWins := uint32(merged.Wins) + uint32(newer[j].Data.Wins)
+				if newWins > 65535 {
+					newWins = 65535
+				}
+				newDraws := uint32(merged.Draws) + uint32(newer[j].Data.Draws)
+				if newDraws > 65535 {
+					newDraws = 65535
+				}
+				newLosses := uint32(merged.Losses) + uint32(newer[j].Data.Losses)
+				if newLosses > 65535 {
+					newLosses = 65535
+				}
 				merged.Wins = uint16(newWins)
-			}
-			newDraws := uint32(merged.Draws) + uint32(newer[j].Data.Draws)
-			if newDraws > 65535 {
-				merged.Draws = 65535
-			} else {
 				merged.Draws = uint16(newDraws)
-			}
-			newLosses := uint32(merged.Losses) + uint32(newer[j].Data.Losses)
-			if newLosses > 65535 {
-				merged.Losses = 65535
-			} else {
 				merged.Losses = uint16(newLosses)
 			}
 			// Keep evaluation data from newer if it has any, otherwise keep existing
@@ -1714,26 +1934,6 @@ func mergeBlockRecords(existing, newer []BlockRecord) []BlockRecord {
 	return result
 }
 
-// FlushIfNeededV7 flushes pack files if dirty count exceeds threshold
-func (ps *PositionStore) FlushIfNeededV7(threshold int) error {
-	if ps.DirtyPackCount() >= threshold {
-		return ps.FlushAllV7()
-	}
-	return nil
-}
-
-// FlushIfNeededV7Async starts a background flush if dirty count exceeds threshold
-func (ps *PositionStore) FlushIfNeededV7Async(threshold int) bool {
-	if ps.DirtyPackCount() >= threshold {
-		if ps.IsFlushRunning() {
-			return true
-		}
-		ps.FlushAllV7Async()
-		return true
-	}
-	return false
-}
-
 // PSStats holds position store statistics
 type PSStats struct {
 	TotalReads         uint64
@@ -1751,6 +1951,24 @@ type PSStats struct {
 	TotalGames         uint64 // Total games ingested
 	TotalFolders       uint64 // Total folders (king position combinations)
 	TotalBlocks        uint64 // Total block files
+
+	// Positions per block distribution
+	PositionsPerBlockMin uint64
+	PositionsPerBlockP25 uint64
+	PositionsPerBlockP50 uint64
+	PositionsPerBlockP75 uint64
+	PositionsPerBlockMax uint64
+
+	// Block size distribution (compressed bytes)
+	BlockSizeBytesMin uint64
+	BlockSizeBytesP25 uint64
+	BlockSizeBytesP50 uint64
+	BlockSizeBytesP75 uint64
+	BlockSizeBytesMax uint64
+
+	// Block format version counts
+	V10Blocks uint64
+	V11Blocks uint64
 }
 
 // PSMeta holds persistent metadata for the position store
@@ -1765,6 +1983,24 @@ type PSMeta struct {
 	TotalGames         uint64 `json:"total_games"`
 	TotalFolders       uint64 `json:"total_folders"`
 	TotalBlocks        uint64 `json:"total_blocks"`
+
+	// Positions per block distribution
+	PositionsPerBlockMin uint64 `json:"positions_per_block_min"`
+	PositionsPerBlockP25 uint64 `json:"positions_per_block_p25"`
+	PositionsPerBlockP50 uint64 `json:"positions_per_block_p50"`
+	PositionsPerBlockP75 uint64 `json:"positions_per_block_p75"`
+	PositionsPerBlockMax uint64 `json:"positions_per_block_max"`
+
+	// Block size distribution (compressed bytes)
+	BlockSizeBytesMin uint64 `json:"block_size_bytes_min"`
+	BlockSizeBytesP25 uint64 `json:"block_size_bytes_p25"`
+	BlockSizeBytesP50 uint64 `json:"block_size_bytes_p50"`
+	BlockSizeBytesP75 uint64 `json:"block_size_bytes_p75"`
+	BlockSizeBytesMax uint64 `json:"block_size_bytes_max"`
+
+	// Block format version counts
+	V10Blocks uint64 `json:"v10_blocks"`
+	V11Blocks uint64 `json:"v11_blocks"`
 }
 
 // Stats returns position store statistics
@@ -1798,6 +2034,21 @@ func (ps *PositionStore) Stats() PSStats {
 		TotalGames:         meta.TotalGames,
 		TotalFolders:       meta.TotalFolders,
 		TotalBlocks:        meta.TotalBlocks,
+
+		PositionsPerBlockMin: meta.PositionsPerBlockMin,
+		PositionsPerBlockP25: meta.PositionsPerBlockP25,
+		PositionsPerBlockP50: meta.PositionsPerBlockP50,
+		PositionsPerBlockP75: meta.PositionsPerBlockP75,
+		PositionsPerBlockMax: meta.PositionsPerBlockMax,
+
+		BlockSizeBytesMin: meta.BlockSizeBytesMin,
+		BlockSizeBytesP25: meta.BlockSizeBytesP25,
+		BlockSizeBytesP50: meta.BlockSizeBytesP50,
+		BlockSizeBytesP75: meta.BlockSizeBytesP75,
+		BlockSizeBytesMax: meta.BlockSizeBytesMax,
+
+		V10Blocks: meta.V10Blocks,
+		V11Blocks: meta.V11Blocks,
 	}
 }
 
@@ -1848,6 +2099,204 @@ func (ps *PositionStore) SaveMeta() error {
 	return nil
 }
 
+// blockStats holds statistics for a single block file
+type blockStats struct {
+	fileSize          uint64
+	numRecords        uint64
+	uncompressedBytes uint64
+	cpPositions       uint64
+	dtmPositions      uint64
+	dtzPositions      uint64
+	evalPositions     uint64
+	isV11             bool
+}
+
+// RefreshMeta recalculates metadata by scanning all block files on disk.
+// Uses parallel workers for faster processing.
+func (ps *PositionStore) RefreshMeta() error {
+	ps.log("refreshing metadata from disk...")
+
+	// First, collect all block file paths
+	var blockPaths []string
+	err := filepath.WalkDir(ps.dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".block") {
+			relPath, _ := filepath.Rel(ps.dir, path)
+			blockPaths = append(blockPaths, relPath)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("walk blocks: %w", err)
+	}
+
+	if len(blockPaths) == 0 {
+		ps.metaMu.Lock()
+		ps.meta = PSMeta{TotalGames: ps.meta.TotalGames}
+		ps.metaMu.Unlock()
+		ps.log("metadata refreshed: 0 blocks")
+		return nil
+	}
+
+	// Process blocks in parallel
+	numWorkers := runtime.NumCPU()
+	if numWorkers > 16 {
+		numWorkers = 16
+	}
+
+	pathChan := make(chan string, len(blockPaths))
+	resultChan := make(chan blockStats, len(blockPaths))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Each worker needs its own decoder for thread safety
+			decoder, _ := zstd.NewReader(nil)
+			defer decoder.Close()
+
+			for relPath := range pathChan {
+				stats := ps.processBlockForRefresh(relPath, decoder)
+				resultChan <- stats
+			}
+		}()
+	}
+
+	// Send work
+	for _, path := range blockPaths {
+		pathChan <- path
+	}
+	close(pathChan)
+
+	// Wait for workers and close results
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	var meta PSMeta
+	meta.TotalGames = ps.meta.TotalGames // Preserve game count
+
+	var blockSizes []uint64
+	var positionCounts []uint64
+
+	for stats := range resultChan {
+		meta.TotalBlocks++
+		meta.CompressedBytes += stats.fileSize
+		meta.TotalPositions += stats.numRecords
+		meta.UncompressedBytes += stats.uncompressedBytes
+		meta.CPPositions += stats.cpPositions
+		meta.DTMPositions += stats.dtmPositions
+		meta.DTZPositions += stats.dtzPositions
+		meta.EvaluatedPositions += stats.evalPositions
+
+		if stats.isV11 {
+			meta.V11Blocks++
+		} else {
+			meta.V10Blocks++
+		}
+
+		blockSizes = append(blockSizes, stats.fileSize)
+		positionCounts = append(positionCounts, stats.numRecords)
+	}
+
+	// Calculate percentiles
+	if len(blockSizes) > 0 {
+		sort.Slice(blockSizes, func(i, j int) bool { return blockSizes[i] < blockSizes[j] })
+		meta.BlockSizeBytesMin = blockSizes[0]
+		meta.BlockSizeBytesMax = blockSizes[len(blockSizes)-1]
+		meta.BlockSizeBytesP25 = blockSizes[len(blockSizes)*25/100]
+		meta.BlockSizeBytesP50 = blockSizes[len(blockSizes)*50/100]
+		meta.BlockSizeBytesP75 = blockSizes[len(blockSizes)*75/100]
+	}
+	if len(positionCounts) > 0 {
+		sort.Slice(positionCounts, func(i, j int) bool { return positionCounts[i] < positionCounts[j] })
+		meta.PositionsPerBlockMin = positionCounts[0]
+		meta.PositionsPerBlockMax = positionCounts[len(positionCounts)-1]
+		meta.PositionsPerBlockP25 = positionCounts[len(positionCounts)*25/100]
+		meta.PositionsPerBlockP50 = positionCounts[len(positionCounts)*50/100]
+		meta.PositionsPerBlockP75 = positionCounts[len(positionCounts)*75/100]
+	}
+
+	// Update metadata
+	ps.metaMu.Lock()
+	ps.meta = meta
+	ps.metaMu.Unlock()
+
+	ps.log("metadata refreshed: %d blocks, %d positions, %d evals, %d bytes (v10=%d, v11=%d)",
+		meta.TotalBlocks, meta.TotalPositions, meta.EvaluatedPositions, meta.CompressedBytes,
+		meta.V10Blocks, meta.V11Blocks)
+
+	return nil
+}
+
+// processBlockForRefresh processes a single block file and returns its stats
+func (ps *PositionStore) processBlockForRefresh(relPath string, decoder *zstd.Decoder) blockStats {
+	var stats blockStats
+
+	fullPath := filepath.Join(ps.dir, relPath)
+
+	// Get file size
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return stats
+	}
+	stats.fileSize = uint64(info.Size())
+
+	// Read and decompress
+	compressedData, err := os.ReadFile(fullPath)
+	if err != nil {
+		return stats
+	}
+
+	decompressed, err := decoder.DecodeAll(compressedData, nil)
+	if err != nil || len(decompressed) < PSBlockHeaderSize {
+		return stats
+	}
+
+	header, err := decodeBlockHeader(decompressed)
+	if err != nil {
+		return stats
+	}
+
+	stats.isV11 = header.Version >= PSBlockVersionV11
+
+	// Decode records
+	_, level, _ := ParseBlockFilePath(relPath)
+	records, err := decodeBlockRecordsAtLevel(decompressed[PSBlockHeaderSize:], int(header.RecordCount), level, header.Version)
+	if err != nil {
+		return stats
+	}
+
+	stats.numRecords = uint64(len(records))
+	stats.uncompressedBytes = uint64(len(records) * BlockRecordSizeAtLevel(level))
+
+	for _, rec := range records {
+		hasCP := rec.Data.HasCP()
+		hasDTM := rec.Data.DTM != DTMUnknown
+		hasDTZ := rec.Data.DTZ != 0
+		if hasCP {
+			stats.cpPositions++
+		}
+		if hasDTM {
+			stats.dtmPositions++
+		}
+		if hasDTZ {
+			stats.dtzPositions++
+		}
+		if hasCP || hasDTM || hasDTZ {
+			stats.evalPositions++
+		}
+	}
+
+	return stats
+}
+
 // PositionCounts holds the results of counting positions in a block
 type PositionCounts struct {
 	Total     uint64
@@ -1857,184 +2306,8 @@ type PositionCounts struct {
 	DTZ       uint64 // Distance to zeroing
 }
 
-// ReconstructKey rebuilds a PackedPosition from prefix and suffix
-// V6: prefix has castle/EP/STM, suffix[0:20] = pieces only
-func ReconstructKey(prefix PSPrefix, suffix PSSuffix) graph.PositionKey {
-	var pos graph.PositionKey
-
-	setSquare := func(sq byte, code byte) {
-		byteIdx := sq / 2
-		if sq%2 == 0 {
-			pos[byteIdx] = (pos[byteIdx] & 0xF0) | code
-		} else {
-			pos[byteIdx] = (pos[byteIdx] & 0x0F) | (code << 4)
-		}
-	}
-
-	// Add kings
-	setSquare(prefix.WKingSq, psPieceWK)
-	setSquare(prefix.BKingSq, psPieceBK)
-
-	// Add pawns from bitboards
-	for sq := 0; sq < 64; sq++ {
-		if prefix.WPawnsBB&(1<<sq) != 0 {
-			setSquare(byte(sq), psPieceWP)
-		}
-		if prefix.BPawnsBB&(1<<sq) != 0 {
-			setSquare(byte(sq), psPieceBP)
-		}
-	}
-
-	// V6 suffix: [pieces:20] (no STM, it's in prefix now)
-	// Unpack pieces from suffix bytes 0-19
-	// Each piece is 10 bits: [type:4][square:6]
-	for i := 0; i < MaxSuffixPieces; i++ {
-		bitPos := uint(i * 10)
-		val := unpackBits(&suffix, 0, bitPos, 10)
-		pieceType := (val >> 6) & 0x0F
-		sq := val & 0x3F
-
-		if pieceType == psSuffixEmpty {
-			continue
-		}
-
-		// Map suffix piece type to PackedPosition piece code
-		var code byte
-		switch pieceType {
-		case psSuffixWN:
-			code = psPieceWN
-		case psSuffixWB:
-			code = psPieceWB
-		case psSuffixWR:
-			code = psPieceWR
-		case psSuffixWQ:
-			code = psPieceWQ
-		case psSuffixBN:
-			code = psPieceBN
-		case psSuffixBB:
-			code = psPieceBB
-		case psSuffixBR:
-			code = psPieceBR
-		case psSuffixBQ:
-			code = psPieceBQ
-		}
-
-		setSquare(byte(sq), code)
-	}
-
-	// Get castle, EP, and STM from prefix (V6)
-	flags := prefix.STM & 0x01 // side to move
-	flags |= (prefix.Castle << 1)
-	pos[32] = flags
-
-	// Set EP file from prefix
-	pos[33] = prefix.EP
-
-	return pos
-}
-
-// unpackBits extracts a value from the suffix byte array at the given bit position
-func unpackBits(suffix *PSSuffix, startByte int, bitPos uint, numBits uint) uint16 {
-	var val uint16
-	for i := uint(0); i < numBits; i++ {
-		byteIdx := startByte + int((bitPos+i)/8)
-		bitIdx := 7 - ((bitPos + i) % 8)
-		bit := (suffix[byteIdx] >> bitIdx) & 1
-		val = (val << 1) | uint16(bit)
-	}
-	return val
-}
-
-// ParsePath extracts prefix from a file path (for iteration)
-// V6: Filename is base64(wpawns48+bpawns48+castle+ep+stm).blk = 19 chars + .blk
-func ParsePath(path string) (PSPrefix, error) {
-	var prefix PSPrefix
-
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-
-	// Parse folder name (4 hex chars: WWBB)
-	if len(dir) < 4 {
-		return prefix, fmt.Errorf("invalid folder: %s", dir)
-	}
-	folder := dir
-	if len(folder) > 4 {
-		folder = folder[len(folder)-4:]
-	}
-
-	var wk, bk uint64
-	if _, err := fmt.Sscanf(folder, "%02x%02x", &wk, &bk); err != nil {
-		return prefix, fmt.Errorf("parse folder: %w", err)
-	}
-	prefix.WKingSq = byte(wk)
-	prefix.BKingSq = byte(bk)
-
-	// V6 filename: base64(14 bytes).blk = 19 chars + 4 = 23 chars total
-	if !strings.HasSuffix(base, ".blk") {
-		return prefix, fmt.Errorf("invalid filename extension: %s", base)
-	}
-	encoded := strings.TrimSuffix(base, ".blk")
-	if len(encoded) != 19 {
-		return prefix, fmt.Errorf("invalid filename length: %s (expected 19 base64 chars)", base)
-	}
-
-	// Decode base64
-	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		return prefix, fmt.Errorf("decode filename: %w", err)
-	}
-	if len(decoded) != 14 {
-		return prefix, fmt.Errorf("invalid decoded length: %d (expected 14)", len(decoded))
-	}
-
-	// Unpack: [wpawns48:6bytes][bpawns48:6bytes][castle:4|ep:4][stm:1|pad:7]
-	wp48 := uint64(decoded[0])<<40 | uint64(decoded[1])<<32 | uint64(decoded[2])<<24 |
-		uint64(decoded[3])<<16 | uint64(decoded[4])<<8 | uint64(decoded[5])
-	bp48 := uint64(decoded[6])<<40 | uint64(decoded[7])<<32 | uint64(decoded[8])<<24 |
-		uint64(decoded[9])<<16 | uint64(decoded[10])<<8 | uint64(decoded[11])
-
-	prefix.WPawnsBB = pawnBBFrom48(wp48)
-	prefix.BPawnsBB = pawnBBFrom48(bp48)
-	prefix.Castle = (decoded[12] >> 4) & 0x0F
-	prefix.EP = decoded[12] & 0x0F
-	if prefix.EP == 0x0F {
-		prefix.EP = psNoEP
-	}
-	prefix.STM = (decoded[13] >> 7) & 0x01
-
-	return prefix, nil
-}
-
-// encodePrefix writes a prefix to bytes (for metadata)
-// V6: Includes castle/EP/STM
-func encodePrefix(p PSPrefix) []byte {
-	buf := make([]byte, 21) // 1+1+8+8+1+1+1
-	buf[0] = p.WKingSq
-	buf[1] = p.BKingSq
-	binary.BigEndian.PutUint64(buf[2:10], p.WPawnsBB)
-	binary.BigEndian.PutUint64(buf[10:18], p.BPawnsBB)
-	buf[18] = p.Castle
-	buf[19] = p.EP
-	buf[20] = p.STM
-	return buf
-}
-
-// decodePrefix reads a prefix from bytes
-// V6: Includes castle/EP/STM
-func decodePrefix(data []byte) PSPrefix {
-	prefix := PSPrefix{
-		WKingSq:  data[0],
-		BKingSq:  data[1],
-		WPawnsBB: binary.BigEndian.Uint64(data[2:10]),
-		BPawnsBB: binary.BigEndian.Uint64(data[10:18]),
-	}
-	if len(data) >= 20 {
-		prefix.Castle = data[18]
-		prefix.EP = data[19]
-	}
-	if len(data) >= 21 {
-		prefix.STM = data[20]
-	}
-	return prefix
+// LoadBlockFilePublic is a public wrapper for loading block files (for export tool)
+func (ps *PositionStore) LoadBlockFilePublic(filename string) ([]BlockRecord, error) {
+	return ps.loadBlockFile(filename)
 }
 

@@ -3,10 +3,10 @@ package graph
 import (
 	"time"
 
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 )
 
-// PositionKey is a 34-byte packed position from the pgn library.
+// PositionKey is a 26-byte packed position from the pgn library.
 type PositionKey = pgn.PackedPosition
 
 // NodeID is an alias for PositionKey.

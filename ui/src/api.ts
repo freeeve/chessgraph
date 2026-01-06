@@ -19,6 +19,8 @@ export interface TreeNode {
   fen: string;           // FEN string
   uci?: string;          // UCI move that led here
   san?: string;          // SAN move that led here
+  eco?: string;          // ECO opening code
+  opening?: string;      // Opening name
   count: number;         // Total games
   wins: number;          // Wins for side to move
   draws: number;         // Draws
@@ -35,7 +37,9 @@ export interface TreeNode {
 export interface StatsResponse {
   total_reads: number;
   total_writes: number;
-  dirty_files: number;
+  l0_files: number;
+  l1_files: number;
+  total_blocks: number;
   cached_blocks: number;
   read_only: boolean;
   total_positions: number;
@@ -46,8 +50,6 @@ export interface StatsResponse {
   uncompressed_bytes: number;
   compressed_bytes: number;
   total_games: number;
-  total_folders: number;
-  total_blocks: number;
 }
 
 const API_BASE = '/v1';

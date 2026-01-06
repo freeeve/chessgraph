@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 	"github.com/freeeve/uci"
 	"github.com/rs/zerolog"
 
@@ -43,7 +43,7 @@ type RefutationJob struct {
 type TablebasePool struct {
 	cfg TablebasePoolConfig
 	log zerolog.Logger
-	ps  *store.PositionStore
+	ps  store.WriteStore
 
 	workQueue       chan pgn.PackedPosition
 	browseQueue     *BrowseQueue // Priority queue for user-browsed positions
@@ -66,7 +66,7 @@ type TablebasePool struct {
 }
 
 // NewTablebasePool creates a new tablebase evaluation pool.
-func NewTablebasePool(cfg TablebasePoolConfig, ps *store.PositionStore) (*TablebasePool, error) {
+func NewTablebasePool(cfg TablebasePoolConfig, ps store.WriteStore) (*TablebasePool, error) {
 	if cfg.StockfishPath == "" {
 		return nil, fmt.Errorf("stockfish path required")
 	}
@@ -151,6 +151,16 @@ func (p *TablebasePool) SetActiveWorkers(n int) int {
 	return n
 }
 
+// Pause stops all workers (implements ingest.Pausable).
+func (p *TablebasePool) Pause() {
+	p.SetActiveWorkers(0)
+}
+
+// Resume restarts all workers (implements ingest.Pausable).
+func (p *TablebasePool) Resume() {
+	p.SetActiveWorkers(int(p.maxWorkers))
+}
+
 // BrowseQueue returns the browse queue for external enqueuing.
 func (p *TablebasePool) BrowseQueue() *BrowseQueue {
 	return p.browseQueue
@@ -223,10 +233,8 @@ func (p *TablebasePool) Run(ctx context.Context) error {
 	// Wait for workers to finish
 	p.wg.Wait()
 
-	// Final flush
-	if err := p.ps.FlushAll(); err != nil {
-		p.log.Warn().Err(err).Msg("final flush failed")
-	}
+	// Trigger async flush (main shutdown will do final sync flush with metadata refresh)
+	p.ps.FlushAllAsync()
 
 	p.log.Info().
 		Int64("total_evaluated", atomic.LoadInt64(&p.evaluated)).

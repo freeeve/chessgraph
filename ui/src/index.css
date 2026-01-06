@@ -345,6 +345,41 @@ h1 {
   text-align: center;
 }
 
+/* ECO opening display */
+.eco-display {
+  text-align: center;
+  padding: 0.3rem 0.4rem;
+  margin-bottom: 0.4rem;
+  background: rgba(100, 181, 246, 0.1);
+  border-radius: 4px;
+  border-left: 3px solid #64b5f6;
+}
+
+.eco-display.eco-highlighted {
+  background: rgba(100, 181, 246, 0.25);
+}
+
+.eco-code {
+  font-weight: bold;
+  color: #64b5f6;
+  font-size: 0.8rem;
+  margin-right: 0.3rem;
+}
+
+.eco-name {
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 0.7rem;
+}
+
+/* ECO highlighted moves - same color as ECO display */
+.white-move.eco-highlighted,
+.black-move.eco-highlighted {
+  background: rgba(100, 181, 246, 0.25);
+  border-radius: 2px;
+  padding: 0 2px;
+  margin: 0 -2px;
+}
+
 .move-list {
   display: flex;
   flex-wrap: wrap;
@@ -764,6 +799,25 @@ h1 {
   padding: 0.5rem 1rem;
   border-radius: 4px;
   font-size: 0.9rem;
+}
+
+/* Subtle transitioning indicator - thin bar at top */
+.transitioning-indicator {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, #64b5f6 0%, #64b5f6 30%, transparent 30%);
+  background-size: 200% 100%;
+  animation: transitioning-slide 0.8s linear infinite;
+  opacity: 0.7;
+  z-index: 1000;
+}
+
+@keyframes transitioning-slide {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
 }
 
 /* Pagination buttons */

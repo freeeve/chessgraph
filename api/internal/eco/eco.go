@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 )
 
 // Opening represents an ECO opening classification.

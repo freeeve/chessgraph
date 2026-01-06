@@ -3,7 +3,7 @@ package eval
 import (
 	"sync"
 
-	"github.com/freeeve/pgn/v2"
+	"github.com/freeeve/pgn/v3"
 )
 
 // BrowseQueue manages positions to evaluate from user browsing.

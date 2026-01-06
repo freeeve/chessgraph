@@ -18,7 +18,18 @@
       "Bash(./api:*)",
       "Bash(git checkout:*)",
       "Bash(curl:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(go tool cover:*)",
+      "Bash(sort:*)",
+      "Bash(for f in position.go positionstore.go positionstore_keys.go positionstore_builder.go)",
+      "Bash(do echo \"=== $f ===\")",
+      "Bash(do echo -n \"$f: \")",
+      "Bash(go install:*)",
+      "Bash(gocyclo:*)",
+      "Bash(/tmp/ingest-profile:*)",
+      "Bash(/tmp/ingest-opt:*)",
+      "Bash(/tmp/ingest-mem:*)",
+      "Bash(go get:*)"
     ]
   }
 }

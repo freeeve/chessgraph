@@ -1,6 +1,6 @@
 github.com/coreos/go-systemd/v22 v22.5.0/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=
-github.com/freeeve/pgn/v2 v2.2.0 h1:cG66UFZXA/X2vTh9nFVCbmM6ze4Y4zh0NmlDzBKt7pY=
-github.com/freeeve/pgn/v2 v2.2.0/go.mod h1:UJipDJwxwSAk4EGvc0/ZlFKDilP72sWoiHYbB+wfEQ8=
+github.com/freeeve/pgn/v3 v3.1.1 h1:N6hpXIQjQNcgvf6vT9I7GOq3HY4EBzeRBz29wEmkG/Q=
+github.com/freeeve/pgn/v3 v3.1.1/go.mod h1:59s7u2pLPSaGT+Nwbr2YWPetSD2IDQ3MsOrTOa1V0Q0=
 github.com/freeeve/uci v1.0.1 h1:DO7m/vnzFn6DoLNjdWfnrE/v1iilu5QyR5WAJnQVFLM=
 github.com/freeeve/uci v1.0.1/go.mod h1:pTxWfg7nC5Yg1MU0nlhMwxKoLAN9CvibQDOpSZANtZA=
 github.com/godbus/dbus/v5 v5.0.4/go.mod h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA=
@@ -19,6 +19,8 @@ github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINE
 github.com/rs/xid v1.5.0/go.mod h1:trrq9SKmegXys3aeAKXMUTdJsYXVwGY3RLcfgqegfbg=
 github.com/rs/zerolog v1.33.0 h1:1cU2KZkvPxNyfgEmhHAz/1A9Bz+llsdYzklWFzgp0r8=
 github.com/rs/zerolog v1.33.0/go.mod h1:/7mN4D5sKwJLZQ2b/znpjC3/GQWY/xaDXUM0kKWRHss=
+golang.org/x/sync v0.19.0 h1:vV+1eWNmZ5geRlYjzm2adRgW2/mcpevXNg50YZtPCE4=
+golang.org/x/sync v0.19.0/go.mod h1:9KTHXmSnoGruLpwFjVSX0lNNA75CykiMECbovNTZqGI=
 golang.org/x/sys v0.0.0-20220811171246-fbc7d0a398ab/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
 golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
 golang.org/x/sys v0.12.0 h1:CM0HF96J0hcLAwsHPJZjfdNzs0gftsLfgKt57wWHJ0o=

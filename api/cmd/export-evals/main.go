@@ -5,9 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
-
-	"github.com/freeeve/pgn/v2"
+	"strings"
 
 	"github.com/freeeve/chessgraph/api/internal/store"
 )
@@ -16,7 +16,6 @@ func main() {
 	var (
 		positionStoreDir = flag.String("position-store", "./data/positions", "Position store directory")
 		outputPath       = flag.String("output", "evals.csv", "Output CSV file")
-		maxDepth         = flag.Int("depth", 3, "Maximum DFS depth")
 		cachedBlocks     = flag.Int("cached-blocks", 4096, "Number of position store blocks to cache")
 	)
 	flag.Parse()
@@ -46,64 +45,91 @@ func main() {
 	defer writer.Flush()
 
 	// Write header
-	if err := writer.Write([]string{"fen", "cp", "dtm", "dtz"}); err != nil {
+	if err := writer.Write([]string{"fen", "position", "cp", "dtm", "dtz", "proven_depth"}); err != nil {
 		fmt.Fprintf(os.Stderr, "write header: %v\n", err)
 		os.Exit(1)
 	}
 
-	// DFS enumeration
-	startPos := pgn.NewStartingPosition()
-	enum := pgn.NewPositionEnumeratorDFS(startPos)
+	var blocksScanned, positionsChecked, evalsFound uint64
 
-	var positionsChecked, evalsFound uint64
+	fmt.Printf("Scanning all block files...\n")
 
-	fmt.Printf("Starting DFS enumeration to depth %d...\n", *maxDepth)
-
-	callback := func(index uint64, pos *pgn.GameState, depth int) bool {
-		positionsChecked++
-
-		if positionsChecked%100000 == 0 {
-			fmt.Printf("Checked %d positions, found %d evals (depth %d)\n",
-				positionsChecked, evalsFound, depth)
-		}
-
-		// Get packed position key
-		packed := pos.Pack()
-
-		// Look up in store
-		rec, err := ps.Get(packed)
+	// Walk all block files
+	err = filepath.Walk(*positionStoreDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return true // Position not in store, continue
+			return err
 		}
 
-		// Check if it has any evaluation data
-		hasCP := rec.HasCP()
-		hasDTM := rec.DTM != store.DTMUnknown
-		hasDTZ := rec.DTZ != 0
-
-		if !hasCP && !hasDTM && !hasDTZ {
-			return true // No eval data, continue
+		// Skip directories and non-block files
+		if info.IsDir() || !strings.HasSuffix(info.Name(), ".block") {
+			return nil
 		}
 
-		// Write to CSV
-		fen := pos.ToFEN()
-		row := []string{
-			fen,
-			strconv.Itoa(int(rec.CP)),
-			strconv.Itoa(int(rec.DTM)),
-			strconv.Itoa(int(rec.DTZ)),
+		blocksScanned++
+		if blocksScanned%1000 == 0 {
+			fmt.Printf("Scanned %d blocks, checked %d positions, found %d evals\n",
+				blocksScanned, positionsChecked, evalsFound)
 		}
 
-		if err := writer.Write(row); err != nil {
-			fmt.Fprintf(os.Stderr, "write row: %v\n", err)
-			return false
+		// Get relative path for block loading
+		relPath, err := filepath.Rel(*positionStoreDir, path)
+		if err != nil {
+			return err
 		}
 
-		evalsFound++
-		return true
+		// Load the block file
+		records, err := ps.LoadBlockFilePublic(relPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load block %s: %v\n", relPath, err)
+			return nil // Continue with other blocks
+		}
+
+		// Parse prefix and level from path
+		prefix, level, err := store.ParseBlockFilePath(relPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "parse path %s: %v\n", relPath, err)
+			return nil
+		}
+
+		// Check each record for eval data
+		for _, rec := range records {
+			positionsChecked++
+
+			hasCP := rec.Data.HasCP()
+			hasDTM := rec.Data.DTM != store.DTMUnknown
+			hasDTZ := rec.Data.DTZ != 0
+
+			if !hasCP && !hasDTM && !hasDTZ {
+				continue
+			}
+
+			// Reconstruct the full position key
+			posKey := store.ReconstructKeyFromBlock(prefix, rec.Key, level)
+
+			// Write to CSV with FEN and base64 position key
+			row := []string{
+				posKey.ToFEN(),
+				posKey.String(),
+				strconv.Itoa(int(rec.Data.CP)),
+				strconv.Itoa(int(rec.Data.DTM)),
+				strconv.Itoa(int(rec.Data.DTZ)),
+				strconv.Itoa(int(rec.Data.ProvenDepth)),
+			}
+
+			if err := writer.Write(row); err != nil {
+				return fmt.Errorf("write row: %w", err)
+			}
+
+			evalsFound++
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "walk error: %v\n", err)
+		os.Exit(1)
 	}
-
-	enum.EnumerateDFS(*maxDepth, callback)
 
 	writer.Flush()
 	if err := writer.Error(); err != nil {
@@ -111,6 +137,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("\nDone! Checked %d positions, exported %d evals to %s\n",
-		positionsChecked, evalsFound, *outputPath)
+	fmt.Printf("\nDone! Scanned %d blocks, checked %d positions, exported %d evals to %s\n",
+		blocksScanned, positionsChecked, evalsFound, *outputPath)
 }
