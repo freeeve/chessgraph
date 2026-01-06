@@ -5,10 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
 
+	"github.com/freeeve/chessgraph/api/internal/graph"
 	"github.com/freeeve/chessgraph/api/internal/store"
 )
 
@@ -16,22 +15,26 @@ func main() {
 	var (
 		positionStoreDir = flag.String("position-store", "./data/positions", "Position store directory")
 		outputPath       = flag.String("output", "evals.csv", "Output CSV file")
-		cachedBlocks     = flag.Int("cached-blocks", 4096, "Number of position store blocks to cache")
 	)
 	flag.Parse()
 
-	fmt.Printf("Opening position store: %s\n", *positionStoreDir)
+	fmt.Printf("Opening V12 position store: %s\n", *positionStoreDir)
 
-	// Open position store read-only
-	ps, err := store.NewPositionStoreReadOnly(*positionStoreDir, *cachedBlocks)
+	// Open V12 store
+	v12, err := store.NewV12Store(store.V12StoreConfig{
+		Dir: *positionStoreDir,
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open position store: %v\n", err)
+		fmt.Fprintf(os.Stderr, "open V12 store: %v\n", err)
 		os.Exit(1)
 	}
-	defer ps.Close()
+	v12.SetLogger(func(format string, args ...any) {
+		fmt.Printf(format+"\n", args...)
+	})
+	defer v12.Close()
 
-	stats := ps.Stats()
-	fmt.Printf("Store stats: %d positions, %d evaluated\n", stats.TotalPositions, stats.EvaluatedPositions)
+	stats := v12.Stats()
+	fmt.Printf("Store stats: %d positions\n", stats.TotalPositions)
 
 	// Create output file
 	outFile, err := os.Create(*outputPath)
@@ -50,84 +53,59 @@ func main() {
 		os.Exit(1)
 	}
 
-	var blocksScanned, positionsChecked, evalsFound uint64
+	var positionsChecked, evalsFound uint64
 
-	fmt.Printf("Scanning all block files...\n")
+	fmt.Printf("Scanning all L1 files...\n")
 
-	// Walk all block files
-	err = filepath.Walk(*positionStoreDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	// Iterate all records
+	err = v12.IterateAll(func(key [store.V12KeySize]byte, rec *store.PositionRecord) bool {
+		positionsChecked++
+
+		if positionsChecked%1000000 == 0 {
+			fmt.Printf("Checked %d positions, found %d evals\n", positionsChecked, evalsFound)
 		}
 
-		// Skip directories and non-block files
-		if info.IsDir() || !strings.HasSuffix(info.Name(), ".block") {
-			return nil
+		// Check if record has eval data
+		hasCP := rec.HasCP()
+		hasDTM := rec.DTM != store.DTMUnknown
+		hasDTZ := rec.DTZ != 0
+
+		if !hasCP && !hasDTM && !hasDTZ {
+			return true // continue
 		}
 
-		blocksScanned++
-		if blocksScanned%1000 == 0 {
-			fmt.Printf("Scanned %d blocks, checked %d positions, found %d evals\n",
-				blocksScanned, positionsChecked, evalsFound)
+		// Convert key to position key
+		var posKey graph.PositionKey
+		copy(posKey[:], key[:])
+
+		// Get FEN from position
+		pos := posKey.Unpack()
+		fen := ""
+		if pos != nil {
+			fen = pos.ToFEN()
 		}
 
-		// Get relative path for block loading
-		relPath, err := filepath.Rel(*positionStoreDir, path)
-		if err != nil {
-			return err
+		// Write to CSV
+		row := []string{
+			fen,
+			posKey.String(),
+			strconv.Itoa(int(rec.CP)),
+			strconv.Itoa(int(rec.DTM)),
+			strconv.Itoa(int(rec.DTZ)),
+			strconv.Itoa(int(rec.GetProvenDepth())),
 		}
 
-		// Load the block file
-		records, err := ps.LoadBlockFilePublic(relPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load block %s: %v\n", relPath, err)
-			return nil // Continue with other blocks
+		if err := writer.Write(row); err != nil {
+			fmt.Fprintf(os.Stderr, "write row: %v\n", err)
+			return false // stop
 		}
 
-		// Parse prefix and level from path
-		prefix, level, err := store.ParseBlockFilePath(relPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "parse path %s: %v\n", relPath, err)
-			return nil
-		}
-
-		// Check each record for eval data
-		for _, rec := range records {
-			positionsChecked++
-
-			hasCP := rec.Data.HasCP()
-			hasDTM := rec.Data.DTM != store.DTMUnknown
-			hasDTZ := rec.Data.DTZ != 0
-
-			if !hasCP && !hasDTM && !hasDTZ {
-				continue
-			}
-
-			// Reconstruct the full position key
-			posKey := store.ReconstructKeyFromBlock(prefix, rec.Key, level)
-
-			// Write to CSV with FEN and base64 position key
-			row := []string{
-				posKey.ToFEN(),
-				posKey.String(),
-				strconv.Itoa(int(rec.Data.CP)),
-				strconv.Itoa(int(rec.Data.DTM)),
-				strconv.Itoa(int(rec.Data.DTZ)),
-				strconv.Itoa(int(rec.Data.ProvenDepth)),
-			}
-
-			if err := writer.Write(row); err != nil {
-				return fmt.Errorf("write row: %w", err)
-			}
-
-			evalsFound++
-		}
-
-		return nil
+		evalsFound++
+		return true // continue
 	})
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "walk error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "iterate error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -137,6 +115,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("\nDone! Scanned %d blocks, checked %d positions, exported %d evals to %s\n",
-		blocksScanned, positionsChecked, evalsFound, *outputPath)
+	fmt.Printf("\nDone! Checked %d positions, exported %d evals to %s\n",
+		positionsChecked, evalsFound, *outputPath)
 }

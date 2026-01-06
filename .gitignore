@@ -1,3 +1,36 @@
-.idea
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files
 api/data/
+*.pgn.zst
+*.pgn.zstd
+*.csv
+!api/data/eco/*.tsv
+
+# Go binaries and build artifacts
+api/api
+api/import-evals
+api/export-evals
+api/ingest
+api/probe-legacy
+*.test
+*.prof
+*.out
+cover.out
+cpu.prof
+mem.prof
+
+# Node
 ui/node_modules/
+ui/dist/
+
+# Claude settings (local)
+.claude/settings.local.json

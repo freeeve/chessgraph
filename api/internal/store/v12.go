@@ -135,17 +135,31 @@ func decodeV12Header(buf []byte) (*V12Header, error) {
 	return h, nil
 }
 
+// V12WriteStats contains statistics from writing a V12 file
+type V12WriteStats struct {
+	CompressTime time.Duration
+}
+
 // WriteV12File writes records to a V12 format file
 // Records must be sorted by key before calling
 func WriteV12File(path string, records []V12Record, encoder *zstd.Encoder) error {
+	_, err := WriteV12FileWithStats(path, records, encoder)
+	return err
+}
+
+// WriteV12FileWithStats writes records to a V12 format file and returns stats
+// Records must be sorted by key before calling
+func WriteV12FileWithStats(path string, records []V12Record, encoder *zstd.Encoder) (V12WriteStats, error) {
+	var stats V12WriteStats
+
 	if len(records) == 0 {
-		return errors.New("no records to write")
+		return stats, errors.New("no records to write")
 	}
 
 	// Verify sorted
 	for i := 1; i < len(records); i++ {
 		if bytes.Compare(records[i-1].Key[:], records[i].Key[:]) >= 0 {
-			return errors.New("records not sorted or contain duplicates")
+			return stats, errors.New("records not sorted or contain duplicates")
 		}
 	}
 
@@ -185,27 +199,28 @@ func WriteV12File(path string, records []V12Record, encoder *zstd.Encoder) error
 	// Compress body
 	compressStart := time.Now()
 	compressed := encoder.EncodeAll(body, nil)
-	LastCompressTime = time.Since(compressStart)
+	stats.CompressTime = time.Since(compressStart)
+	LastCompressTime = stats.CompressTime // Keep for backward compat
 
 	// Write file
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
+		return stats, err
 	}
 
 	f, err := os.Create(path)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	defer f.Close()
 
 	if _, err := f.Write(encodeV12Header(&header)); err != nil {
-		return err
+		return stats, err
 	}
 	if _, err := f.Write(compressed); err != nil {
-		return err
+		return stats, err
 	}
 
-	return nil
+	return stats, nil
 }
 
 // ReadV12Header reads just the header from a V12 file
@@ -279,6 +294,9 @@ func OpenV12File(path string, decoder *zstd.Decoder) (*V12File, error) {
 			values[i*V12ValueSize+bytePos] = body[keysSize+bytePos*n+i]
 		}
 	}
+
+	// Clear temporaries to help GC (body can be large)
+	body = nil
 
 	return &V12File{
 		path:   path,
@@ -499,5 +517,3 @@ func (idx *V12Index) TotalRecords() uint64 {
 	}
 	return total
 }
-
-var ErrNotFound = errors.New("not found")

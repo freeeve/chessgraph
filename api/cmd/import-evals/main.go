@@ -17,20 +17,24 @@ func main() {
 	var (
 		positionStoreDir = flag.String("position-store", "./data/positions", "Position store directory")
 		inputPath        = flag.String("input", "evals.csv", "Input CSV file")
-		cachedBlocks     = flag.Int("cached-blocks", 256, "Number of position store blocks to cache")
 		createMissing    = flag.Bool("create-missing", true, "Create position records if they don't exist")
 	)
 	flag.Parse()
 
-	fmt.Printf("Opening position store: %s\n", *positionStoreDir)
+	fmt.Printf("Opening V12 position store: %s\n", *positionStoreDir)
 
-	// Open position store
-	ps, err := store.NewPositionStore(*positionStoreDir, *cachedBlocks)
+	// Open V12 store
+	v12, err := store.NewV12Store(store.V12StoreConfig{
+		Dir: *positionStoreDir,
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open position store: %v\n", err)
+		fmt.Fprintf(os.Stderr, "open V12 store: %v\n", err)
 		os.Exit(1)
 	}
-	defer ps.Close()
+	v12.SetLogger(func(format string, args ...any) {
+		fmt.Printf(format+"\n", args...)
+	})
+	defer v12.Close()
 
 	// Open input file
 	inFile, err := os.Open(*inputPath)
@@ -128,7 +132,7 @@ func main() {
 		provenDepth, _ := strconv.Atoi(row[provenDepthCol])
 
 		// Get existing record or create new one
-		rec, err := ps.Get(packed)
+		rec, err := v12.Get(packed)
 		isNew := false
 		if err != nil {
 			if !*createMissing {
@@ -161,7 +165,7 @@ func main() {
 		rec.DTZ = newDTZ
 
 		// Store updated record
-		if err := ps.Put(packed, rec); err != nil {
+		if err := v12.Put(packed, rec); err != nil {
 			fmt.Fprintf(os.Stderr, "put position: %v\n", err)
 			errors++
 			continue
@@ -177,7 +181,7 @@ func main() {
 
 	// Flush
 	fmt.Println("Flushing...")
-	if err := ps.FlushAll(); err != nil {
+	if err := v12.FlushAll(); err != nil {
 		fmt.Fprintf(os.Stderr, "flush: %v\n", err)
 		os.Exit(1)
 	}

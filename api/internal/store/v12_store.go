@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,44 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// logMemStats logs current memory usage
+func (s *V12Store) logMemStats(label string) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	// Count cache sizes
+	s.l0CacheMu.RLock()
+	l0CacheFiles := len(s.l0Cache)
+	s.l0CacheMu.RUnlock()
+
+	s.l1CacheMu.RLock()
+	l1CacheFiles := len(s.l1Cache)
+	s.l1CacheMu.RUnlock()
+
+	// Memtable size
+	var memtableBytes int64
+	for _, mt := range s.memtables {
+		memtableBytes += mt.Size()
+	}
+
+	s.log("MEMORY [%s]: heap=%.2fGB, sys=%.2fGB, l0Cache=%d files, l1Cache=%d files, memtables=%.2fGB, goroutines=%d",
+		label,
+		float64(m.HeapAlloc)/(1024*1024*1024),
+		float64(m.Sys)/(1024*1024*1024),
+		l0CacheFiles,
+		l1CacheFiles,
+		float64(memtableBytes)/(1024*1024*1024),
+		runtime.NumGoroutine())
+}
+
+// V12Metadata holds persistent store metadata
+type V12Metadata struct {
+	TotalGames  uint64 `json:"total_games"`
+	TotalReads  uint64 `json:"total_reads"`
+	TotalWrites uint64 `json:"total_writes"`
+	L1FileCount int64  `json:"l1_file_count"`
+}
+
 // V12Store is the main store using V12 format
 type V12Store struct {
 	dir     string
@@ -26,15 +65,17 @@ type V12Store struct {
 	decoder   *zstd.Decoder
 
 	// Ingest state
-	memtables      []*V12Memtable // one per worker
-	memtableMu     sync.Mutex
-	l0FileCount    int64
-	l1FileCount    int64         // counter for L1 file naming
-	flushMu        sync.RWMutex  // RLock for flushes, Lock for compaction
-	flushSerialize sync.Mutex    // serialize flush operations for backpressure
-	compacting     int32         // atomic flag: 1 if compaction in progress
-	l0Threshold    int           // trigger compaction when L0 files exceed this
-	l0MaxFiles     int           // pause ingestion when L0 files exceed this
+	memtables       []*V12Memtable // one per worker
+	memtableMu      sync.Mutex
+	memtableFlushMu []sync.Mutex   // per-memtable flush locks (avoid global contention)
+	l0FileCount     int64
+	l1FileCount     int64        // counter for L1 file naming
+	flushMu         sync.RWMutex // RLock for flushes, Lock for compaction
+	l0ReserveMu     sync.Mutex   // serializes L0 slot reservation (backpressure check)
+	pendingFlushes  int32        // atomic counter for in-flight L0 writes (for backpressure)
+	compacting      int32        // atomic flag: 1 if compaction in progress
+	l0Threshold     int          // trigger compaction when L0 files exceed this
+	l0MaxFiles      int          // pause ingestion when L0 files exceed this
 
 	// L0 file cache (avoid re-decompressing on every Get)
 	l0Cache      map[string]*V12File
@@ -86,7 +127,7 @@ type V12StoreConfig struct {
 // NewV12Store creates a new V12 store
 func NewV12Store(cfg V12StoreConfig) (*V12Store, error) {
 	if cfg.TargetL0Size == 0 {
-		cfg.TargetL0Size = 512 * 1024 * 1024 // 512MB default uncompressed L0 file size
+		cfg.TargetL0Size = 256 * 1024 * 1024 // 256MB default uncompressed L0 file size (smaller = less memory)
 	}
 	if cfg.NumWorkers == 0 {
 		cfg.NumWorkers = runtime.NumCPU()
@@ -95,10 +136,10 @@ func NewV12Store(cfg V12StoreConfig) (*V12Store, error) {
 		cfg.L0Threshold = 5 // trigger compaction when L0 exceeds 5 files
 	}
 	if cfg.L0CacheMax == 0 {
-		cfg.L0CacheMax = 50 // cache up to 50 L0 files (should be more than enough)
+		cfg.L0CacheMax = 10 // cache up to 10 L0 files (each ~128MB uncompressed)
 	}
 	if cfg.L0MaxFiles == 0 {
-		cfg.L0MaxFiles = 10 // pause ingestion when L0 exceeds 10 files
+		cfg.L0MaxFiles = 20 // pause ingestion when L0 exceeds 20 files
 	}
 
 	l0Dir := filepath.Join(cfg.Dir, "l0")
@@ -124,7 +165,8 @@ func NewV12Store(cfg V12StoreConfig) (*V12Store, error) {
 		return nil, err
 	}
 
-	decoder, err := zstd.NewReader(nil)
+	// Use GOMAXPROCS for decoder concurrency (default is min(4, GOMAXPROCS) which limits parallel decompression)
+	decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
 	if err != nil {
 		return nil, err
 	}
@@ -136,24 +178,25 @@ func NewV12Store(cfg V12StoreConfig) (*V12Store, error) {
 	}
 
 	s := &V12Store{
-		dir:          cfg.Dir,
-		l0Dir:        l0Dir,
-		l1Dir:        l1Dir,
-		index:        NewV12Index(),
-		l0Encoder:    l0Encoder,
-		l1Encoder:    l1Encoder,
-		decoder:      decoder,
-		memtables:    memtables,
-		targetL0Size: cfg.TargetL0Size,
-		numWorkers:   cfg.NumWorkers,
-		l0Threshold:  cfg.L0Threshold,
-		l0MaxFiles:   cfg.L0MaxFiles,
-		l0Cache:      make(map[string]*V12File),
-		l0CacheOrder: make([]string, 0),
-		l0CacheMax:   cfg.L0CacheMax,
-		l1Cache:      make(map[string]*V12File),
-		l1CacheOrder: make([]string, 0),
-		l1CacheMax:   10, // default to 10 cached L1 files
+		dir:             cfg.Dir,
+		l0Dir:           l0Dir,
+		l1Dir:           l1Dir,
+		index:           NewV12Index(),
+		l0Encoder:       l0Encoder,
+		l1Encoder:       l1Encoder,
+		decoder:         decoder,
+		memtables:       memtables,
+		memtableFlushMu: make([]sync.Mutex, cfg.NumWorkers),
+		targetL0Size:    cfg.TargetL0Size,
+		numWorkers:      cfg.NumWorkers,
+		l0Threshold:     cfg.L0Threshold,
+		l0MaxFiles:      cfg.L0MaxFiles,
+		l0Cache:         make(map[string]*V12File),
+		l0CacheOrder:    make([]string, 0),
+		l0CacheMax:      cfg.L0CacheMax,
+		l1Cache:         make(map[string]*V12File),
+		l1CacheOrder:    make([]string, 0),
+		l1CacheMax:      4, // limit cached L1 files (each ~128MB uncompressed)
 	}
 
 	// Load existing L1 index
@@ -161,10 +204,65 @@ func NewV12Store(cfg V12StoreConfig) (*V12Store, error) {
 		return nil, fmt.Errorf("load index: %w", err)
 	}
 
-	// Initialize L1 file counter based on existing files
-	s.l1FileCount = int64(s.index.FileCount())
+	// Load metadata (games count, etc.)
+	if err := s.loadMetadata(); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("load metadata: %w", err)
+	}
+
+	// Initialize L1 file counter - use max of metadata value and actual file count
+	// to handle cases where files were added but metadata wasn't saved
+	if int64(s.index.FileCount()) > s.l1FileCount {
+		s.l1FileCount = int64(s.index.FileCount())
+	}
 
 	return s, nil
+}
+
+// metadataPath returns the path to the metadata file
+func (s *V12Store) metadataPath() string {
+	return filepath.Join(s.dir, "metadata.json")
+}
+
+// loadMetadata loads persistent metadata from disk
+func (s *V12Store) loadMetadata() error {
+	data, err := os.ReadFile(s.metadataPath())
+	if err != nil {
+		return err
+	}
+
+	var meta V12Metadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return err
+	}
+
+	atomic.StoreUint64(&s.totalGames, meta.TotalGames)
+	atomic.StoreUint64(&s.totalReads, meta.TotalReads)
+	atomic.StoreUint64(&s.totalWrites, meta.TotalWrites)
+	s.l1FileCount = meta.L1FileCount
+
+	return nil
+}
+
+// saveMetadata saves persistent metadata to disk
+func (s *V12Store) saveMetadata() error {
+	meta := V12Metadata{
+		TotalGames:  atomic.LoadUint64(&s.totalGames),
+		TotalReads:  atomic.LoadUint64(&s.totalReads),
+		TotalWrites: atomic.LoadUint64(&s.totalWrites),
+		L1FileCount: atomic.LoadInt64(&s.l1FileCount),
+	}
+
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Write to temp file then rename for atomicity
+	tempPath := s.metadataPath() + ".tmp"
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, s.metadataPath())
 }
 
 // SetLogger sets the logging function
@@ -458,13 +556,14 @@ func (s *V12Store) CheckFlush() error {
 
 // FlushMemtable flushes a specific memtable to L0
 func (s *V12Store) FlushMemtable(idx int) error {
-	// Serialize flush operations to prevent race where multiple workers
-	// all check L0 count, all see it's below threshold, and all flush
-	s.flushSerialize.Lock()
-	defer s.flushSerialize.Unlock()
+	// Per-memtable lock allows concurrent flushes from different workers
+	s.memtableFlushMu[idx].Lock()
+	defer s.memtableFlushMu[idx].Unlock()
 
-	// Wait for L0 space BEFORE taking flushMu (avoids deadlock with compaction)
-	s.waitForL0Space()
+	// Wait for L0 space and reserve our slot (increments pendingFlushes)
+	s.waitForL0SpaceAndReserve()
+	// Release our slot after flush completes (or fails)
+	defer atomic.AddInt32(&s.pendingFlushes, -1)
 
 	s.flushMu.RLock() // Block during compaction
 	defer s.flushMu.RUnlock()
@@ -533,12 +632,20 @@ func (s *V12Store) maybeCompactAsync() {
 	}
 }
 
-// waitForL0Space blocks until L0 file count is below the max threshold
-func (s *V12Store) waitForL0Space() {
+// waitForL0SpaceAndReserve waits until there's room for another L0 file,
+// then atomically reserves a slot by incrementing pendingFlushes.
+// Caller must call atomic.AddInt32(&s.pendingFlushes, -1) after writing.
+func (s *V12Store) waitForL0SpaceAndReserve() {
 	logged := false
 	for {
+		// Serialize the check+reserve to prevent race where multiple workers
+		// all see room and all reserve before any writes complete
+		s.l0ReserveMu.Lock()
+
 		entries, err := os.ReadDir(s.l0Dir)
 		if err != nil {
+			atomic.AddInt32(&s.pendingFlushes, 1)
+			s.l0ReserveMu.Unlock()
 			return
 		}
 		l0Count := 0
@@ -548,12 +655,22 @@ func (s *V12Store) waitForL0Space() {
 			}
 		}
 
-		if l0Count < s.l0MaxFiles {
+		// Include pending flushes (in-flight writes) in the count
+		pending := atomic.LoadInt32(&s.pendingFlushes)
+		total := l0Count + int(pending)
+
+		if total < s.l0MaxFiles {
+			// Reserve our slot while holding the lock
+			atomic.AddInt32(&s.pendingFlushes, 1)
+			s.l0ReserveMu.Unlock()
 			return
 		}
 
+		s.l0ReserveMu.Unlock()
+
 		if !logged {
-			s.log("L0 files (%d) at max (%d), waiting for compaction...", l0Count, s.l0MaxFiles)
+			s.log("L0 files (%d on disk + %d pending = %d) at max (%d), waiting for compaction...",
+				l0Count, pending, total, s.l0MaxFiles)
 			logged = true
 			// Ensure compaction is running
 			go s.CompactL0()
@@ -588,6 +705,8 @@ func (s *V12Store) CompactL0() error {
 	}
 	defer atomic.StoreInt32(&s.compacting, 0)
 
+	s.logMemStats("compaction-start")
+
 	const l0BatchSize = 10 // Process this many L0 files at a time
 
 	for {
@@ -606,6 +725,10 @@ func (s *V12Store) CompactL0() error {
 
 		if len(l0Files) == 0 {
 			s.log("compaction complete: all L0 files processed")
+			// Save metadata to persist L1 file count and stats
+			if err := s.saveMetadata(); err != nil {
+				s.log("warning: failed to save metadata: %v", err)
+			}
 			return nil
 		}
 
@@ -646,6 +769,15 @@ func (s *V12Store) CompactL0() error {
 		s.log("batch complete: %d L1 files, %d total records",
 			s.index.FileCount(), s.index.TotalRecords())
 
+		// Save metadata after each batch to persist progress
+		if err := s.saveMetadata(); err != nil {
+			s.log("warning: failed to save metadata: %v", err)
+		}
+
+		// Force GC to release compaction memory
+		runtime.GC()
+		s.logMemStats("after-batch-gc")
+
 		// Continue loop - it will re-read L0 dir and exit when empty
 	}
 }
@@ -656,36 +788,75 @@ func (s *V12Store) mergeL0BatchIntoL1(l0Paths []string) error {
 		return nil
 	}
 
-	// Load and merge all L0 files in this batch
-	var allL0Records []V12Record
-	for _, path := range l0Paths {
-		f, err := OpenV12File(path, s.decoder)
-		if err != nil {
-			return fmt.Errorf("open L0 %s: %w", path, err)
-		}
-		iter := f.Iterator()
-		for {
-			rec := iter.Next()
-			if rec == nil {
-				break
-			}
-			allL0Records = append(allL0Records, *rec)
-		}
+	// Load L0 files in parallel
+	type l0Result struct {
+		idx     int
+		records []V12Record
+		err     error
 	}
+	l0ResultChan := make(chan l0Result, len(l0Paths))
+
+	for i, path := range l0Paths {
+		go func(idx int, p string) {
+			f, err := OpenV12File(p, s.decoder)
+			if err != nil {
+				l0ResultChan <- l0Result{idx: idx, err: fmt.Errorf("open L0 %s: %w", p, err)}
+				return
+			}
+			// Pre-allocate to avoid repeated slice growth
+			records := make([]V12Record, 0, f.RecordCount())
+			iter := f.Iterator()
+			for {
+				rec := iter.Next()
+				if rec == nil {
+					break
+				}
+				records = append(records, *rec)
+			}
+			l0ResultChan <- l0Result{idx: idx, records: records}
+		}(i, path)
+	}
+
+	// Collect L0 results
+	l0Results := make([]l0Result, len(l0Paths))
+	for range l0Paths {
+		r := <-l0ResultChan
+		l0Results[r.idx] = r
+	}
+
+	// Check for errors and count total records for pre-allocation
+	totalRecords := 0
+	for _, r := range l0Results {
+		if r.err != nil {
+			return r.err
+		}
+		totalRecords += len(r.records)
+	}
+
+	// Merge records with pre-allocated capacity
+	allL0Records := make([]V12Record, 0, totalRecords)
+	for _, r := range l0Results {
+		allL0Records = append(allL0Records, r.records...)
+	}
+
+	s.logMemStats(fmt.Sprintf("after-l0-load (%d records)", len(allL0Records)))
 
 	if len(allL0Records) == 0 {
 		return nil
 	}
 
-	// Sort L0 records by key
-	sort.Slice(allL0Records, func(i, j int) bool {
-		return bytes.Compare(allL0Records[i].Key[:], allL0Records[j].Key[:]) < 0
-	})
+	// Sort L0 records by key using parallel sort for large sets
+	sortStart := time.Now()
+	allL0Records = parallelSortRecords(allL0Records, runtime.NumCPU())
+	s.log("  sorted %d L0 records in %v using %d workers", len(allL0Records), time.Since(sortStart), runtime.NumCPU())
+
+	s.logMemStats("after-sort")
 
 	// Merge duplicate keys within L0
 	allL0Records = mergeAdjacentRecords(allL0Records)
 
 	s.log("  L0 batch: %d records after merge", len(allL0Records))
+	s.logMemStats("after-merge-adjacent")
 
 	// Get L1 files sorted by MinKey
 	l1Files := s.index.Files()
@@ -733,71 +904,119 @@ func (s *V12Store) mergeL0BatchIntoL1(l0Paths []string) error {
 	s.log("  affected L1 files: %d (merge-before: %v, merge-after: %v)",
 		len(affectedFiles), mergeBeforeIntoFirst, mergeAfterIntoLast)
 
-	// Process each affected L1 file
-	var newFiles []V12FileRange
+	// Pre-compute L0 record ranges for each affected L1 file
+	type l1Work struct {
+		l1Range   V12FileRange
+		l0Start   int
+		l0End     int
+		isFirst   bool
+		isLast    bool
+	}
+	workItems := make([]l1Work, len(affectedFiles))
 	l0Idx := 0
 
-	for _, l1Range := range affectedFiles {
-		// Load L1 file
-		l1File, err := OpenV12File(l1Range.Path, s.decoder)
-		if err != nil {
-			return fmt.Errorf("open L1 %s: %w", l1Range.Path, err)
-		}
+	for i, l1Range := range affectedFiles {
+		isFirst := i == 0
+		isLast := i == len(affectedFiles)-1
 
-		// Get L1 records
-		var l1Records []V12Record
-		iter := l1File.Iterator()
-		for {
-			rec := iter.Next()
-			if rec == nil {
-				break
-			}
-			l1Records = append(l1Records, *rec)
-		}
-
-		// Find L0 records that belong in this L1 file's key range
-		// For the first affected file, include all L0 records <= its max key
-		// For the last affected file, include all L0 records >= its min key
-		// For middle files, include L0 records within [minKey, maxKey]
-		var l0ForThisFile []V12Record
-		isFirst := len(newFiles) == 0
-		isLast := l1Range.Path == affectedFiles[len(affectedFiles)-1].Path
-
+		l0Start := l0Idx
 		for l0Idx < len(allL0Records) {
 			rec := allL0Records[l0Idx]
 
-			// Check if this record belongs to this file
 			belongsHere := false
 			if isFirst && isLast {
-				// Only one affected file - take all L0 records
 				belongsHere = true
 			} else if isFirst {
-				// First file - take records up to this file's max key
 				belongsHere = bytes.Compare(rec.Key[:], l1Range.MaxKey[:]) <= 0
 			} else if isLast {
-				// Last file - take all remaining records
 				belongsHere = true
 			} else {
-				// Middle file - take records within range
 				belongsHere = bytes.Compare(rec.Key[:], l1Range.MaxKey[:]) <= 0
 			}
 
 			if !belongsHere {
 				break
 			}
-			l0ForThisFile = append(l0ForThisFile, rec)
 			l0Idx++
 		}
 
-		// Merge L1 + L0 records
-		merged := MergeV12Records(l1Records, l0ForThisFile)
-
-		// Write merged file (may split if too large)
-		written, err := s.writeMergedL1File(l1Range.Path, merged)
-		if err != nil {
-			return err
+		workItems[i] = l1Work{
+			l1Range: l1Range,
+			l0Start: l0Start,
+			l0End:   l0Idx,
+			isFirst: isFirst,
+			isLast:  isLast,
 		}
-		newFiles = append(newFiles, written...)
+	}
+
+	// Process L1 files in parallel (limited concurrency to control memory)
+	type l1Result struct {
+		idx   int
+		files []V12FileRange
+		err   error
+	}
+
+	const maxConcurrentL1 = 16 // Limit concurrent L1 files in memory (~2GB max)
+	semaphore := make(chan struct{}, maxConcurrentL1)
+
+	resultChan := make(chan l1Result, len(workItems))
+	for i, work := range workItems {
+		go func(idx int, w l1Work) {
+			// Acquire semaphore slot
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Load L1 file
+			l1File, err := OpenV12File(w.l1Range.Path, s.decoder)
+			if err != nil {
+				resultChan <- l1Result{idx: idx, err: fmt.Errorf("open L1 %s: %w", w.l1Range.Path, err)}
+				return
+			}
+
+			// Get L1 records (pre-allocate to avoid slice growth garbage)
+			l1Records := make([]V12Record, 0, l1File.RecordCount())
+			iter := l1File.Iterator()
+			for {
+				rec := iter.Next()
+				if rec == nil {
+					break
+				}
+				l1Records = append(l1Records, *rec)
+			}
+
+			// Get L0 records for this file
+			l0ForThisFile := allL0Records[w.l0Start:w.l0End]
+
+			// Merge L1 + L0 records
+			merged := MergeV12Records(l1Records, l0ForThisFile)
+
+			// Write merged file (may split if too large)
+			written, err := s.writeMergedL1File(w.l1Range.Path, merged)
+			if err != nil {
+				resultChan <- l1Result{idx: idx, err: err}
+				return
+			}
+
+			resultChan <- l1Result{idx: idx, files: written}
+		}(i, work)
+	}
+
+	// Collect results in order
+	results := make([]l1Result, len(workItems))
+	for range workItems {
+		r := <-resultChan
+		results[r.idx] = r
+	}
+
+	s.logMemStats("after-l1-processing")
+
+	// Check for errors and collect new files
+	var newFiles []V12FileRange
+	for _, r := range results {
+		if r.err != nil {
+			return r.err
+		}
+		newFiles = append(newFiles, r.files...)
 	}
 
 	// Track which paths we wrote to (so we don't delete them)
@@ -902,14 +1121,19 @@ func (s *V12Store) nextL1Filename() string {
 	return fmt.Sprintf("l1_%06d.psv2", n)
 }
 
-// writeNewL1Files writes records as new L1 files
+// writeNewL1Files writes records as new L1 files (in parallel)
 func (s *V12Store) writeNewL1FilesChunked(records []V12Record) ([]V12FileRange, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
 
-	var result []V12FileRange
+	// Pre-compute chunks
 	targetRecords := int(V12MinFileSize / V12RecordSize)
+	type chunkInfo struct {
+		records []V12Record
+		path    string
+	}
+	var chunks []chunkInfo
 
 	for start := 0; start < len(records); {
 		end := start + targetRecords
@@ -921,36 +1145,71 @@ func (s *V12Store) writeNewL1FilesChunked(records []V12Record) ([]V12FileRange, 
 			end = len(records)
 		}
 
-		chunk := records[start:end]
 		filename := s.nextL1Filename()
 		path := filepath.Join(s.l1Dir, filename)
+		chunks = append(chunks, chunkInfo{records: records[start:end], path: path})
+		start = end
+	}
 
-		if err := WriteV12File(path, chunk, s.l1Encoder); err != nil {
-			return nil, err
+	// Write chunks in parallel
+	type writeResult struct {
+		idx          int
+		file         V12FileRange
+		compressTime time.Duration
+		err          error
+	}
+	resultChan := make(chan writeResult, len(chunks))
+
+	for i, chunk := range chunks {
+		go func(idx int, c chunkInfo) {
+			stats, err := WriteV12FileWithStats(c.path, c.records, s.l1Encoder)
+			if err != nil {
+				resultChan <- writeResult{idx: idx, err: err}
+				return
+			}
+
+			resultChan <- writeResult{
+				idx:          idx,
+				compressTime: stats.CompressTime,
+				file: V12FileRange{
+					Path:   c.path,
+					MinKey: c.records[0].Key,
+					MaxKey: c.records[len(c.records)-1].Key,
+					Count:  uint32(len(c.records)),
+				},
+			}
+		}(i, chunk)
+	}
+
+	// Collect results in order
+	results := make([]writeResult, len(chunks))
+	for range chunks {
+		r := <-resultChan
+		results[r.idx] = r
+	}
+
+	// Check for errors and build result
+	var result []V12FileRange
+	for i, r := range results {
+		if r.err != nil {
+			return nil, r.err
 		}
+		result = append(result, r.file)
 
 		// Log compression stats
-		uncompressedSize := int64(len(chunk)) * V12RecordSize
-		if fi, err := os.Stat(path); err == nil {
+		chunk := chunks[i]
+		uncompressedSize := int64(len(chunk.records)) * V12RecordSize
+		if fi, err := os.Stat(chunk.path); err == nil {
 			compressedSize := fi.Size()
 			ratio := float64(uncompressedSize) / float64(compressedSize)
 			s.log("  wrote %s: %d records, keys %x..%x (%.1fMB -> %.1fMB, %.1fx, compressed in %v)",
-				filepath.Base(path), len(chunk),
-				chunk[0].Key[:], chunk[len(chunk)-1].Key[:],
+				filepath.Base(chunk.path), len(chunk.records),
+				chunk.records[0].Key[:], chunk.records[len(chunk.records)-1].Key[:],
 				float64(uncompressedSize)/(1024*1024),
 				float64(compressedSize)/(1024*1024),
 				ratio,
-				LastCompressTime)
+				r.compressTime)
 		}
-
-		result = append(result, V12FileRange{
-			Path:   path,
-			MinKey: chunk[0].Key,
-			MaxKey: chunk[len(chunk)-1].Key,
-			Count:  uint32(len(chunk)),
-		})
-
-		start = end
 	}
 
 	return result, nil
@@ -967,7 +1226,8 @@ func (s *V12Store) writeMergedL1File(oldPath string, records []V12Record) ([]V12
 	if totalSize <= V12MaxFileSize {
 		// Write in place (to temp, then rename)
 		tempPath := oldPath + ".tmp"
-		if err := WriteV12File(tempPath, records, s.l1Encoder); err != nil {
+		stats, err := WriteV12FileWithStats(tempPath, records, s.l1Encoder)
+		if err != nil {
 			return nil, err
 		}
 		if err := os.Rename(tempPath, oldPath); err != nil {
@@ -986,7 +1246,7 @@ func (s *V12Store) writeMergedL1File(oldPath string, records []V12Record) ([]V12
 				float64(uncompressedSize)/(1024*1024),
 				float64(compressedSize)/(1024*1024),
 				ratio,
-				LastCompressTime)
+				stats.CompressTime)
 		}
 
 		return []V12FileRange{{
@@ -1023,7 +1283,8 @@ func (s *V12Store) writeMergedL1File(oldPath string, records []V12Record) ([]V12
 		}
 
 		tempPath := path + ".tmp"
-		if err := WriteV12File(tempPath, chunk, s.l1Encoder); err != nil {
+		stats, err := WriteV12FileWithStats(tempPath, chunk, s.l1Encoder)
+		if err != nil {
 			return nil, err
 		}
 		if err := os.Rename(tempPath, path); err != nil {
@@ -1042,7 +1303,7 @@ func (s *V12Store) writeMergedL1File(oldPath string, records []V12Record) ([]V12
 				float64(uncompressedSize)/(1024*1024),
 				float64(compressedSize)/(1024*1024),
 				ratio,
-				LastCompressTime)
+				stats.CompressTime)
 		}
 
 		result = append(result, V12FileRange{
@@ -1129,6 +1390,10 @@ func (s *V12Store) Close() error {
 	if err := s.FlushAll(); err != nil {
 		return err
 	}
+	// Save metadata
+	if err := s.saveMetadata(); err != nil {
+		return fmt.Errorf("save metadata: %w", err)
+	}
 	return nil
 }
 
@@ -1151,6 +1416,30 @@ func (s *V12Store) IsReadOnly() bool {
 	return false
 }
 
+// IterateAll iterates over all records in the store (L1 files only, for export).
+// The callback receives each key and record. Return false to stop iteration.
+func (s *V12Store) IterateAll(fn func(key [V12KeySize]byte, rec *PositionRecord) bool) error {
+	// Iterate L1 files
+	for _, fileRange := range s.index.Files() {
+		f, err := OpenV12File(fileRange.Path, s.decoder)
+		if err != nil {
+			return fmt.Errorf("open L1 file %s: %w", fileRange.Path, err)
+		}
+
+		iter := f.Iterator()
+		for {
+			rec := iter.Next()
+			if rec == nil {
+				break
+			}
+			if !fn(rec.Key, &rec.Value) {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
 // FlushAllAsync flushes all memtables asynchronously
 func (s *V12Store) FlushAllAsync() {
 	go func() {
@@ -1167,4 +1456,103 @@ func (s *V12Store) FlushIfMemoryNeededAsync(thresholdBytes int64) bool {
 		return true
 	}
 	return false
+}
+
+// parallelSortRecords sorts records in parallel using divide-and-conquer.
+// It divides the slice into chunks, sorts each in parallel, then merges.
+func parallelSortRecords(records []V12Record, numWorkers int) []V12Record {
+	n := len(records)
+	if n < 100000 || numWorkers <= 1 {
+		// Small slices or single worker: just sort directly
+		sort.Slice(records, func(i, j int) bool {
+			return bytes.Compare(records[i].Key[:], records[j].Key[:]) < 0
+		})
+		return records
+	}
+
+	// Divide into chunks for parallel sorting
+	chunkSize := (n + numWorkers - 1) / numWorkers
+	chunks := make([][]V12Record, 0, numWorkers)
+
+	for i := 0; i < n; i += chunkSize {
+		end := i + chunkSize
+		if end > n {
+			end = n
+		}
+		chunks = append(chunks, records[i:end])
+	}
+
+	// Sort each chunk in parallel
+	var wg sync.WaitGroup
+	wg.Add(len(chunks))
+	for i := range chunks {
+		go func(idx int) {
+			defer wg.Done()
+			sort.Slice(chunks[idx], func(a, b int) bool {
+				return bytes.Compare(chunks[idx][a].Key[:], chunks[idx][b].Key[:]) < 0
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	// K-way merge of sorted chunks
+	return kWayMerge(chunks)
+}
+
+// kWayMerge merges k sorted slices into one sorted slice using parallel pairwise merging.
+// This is O(n log k) and uses multiple cores for the merge phase.
+func kWayMerge(chunks [][]V12Record) []V12Record {
+	if len(chunks) == 0 {
+		return nil
+	}
+	if len(chunks) == 1 {
+		return chunks[0]
+	}
+
+	// Parallel pairwise merge: merge chunks in pairs, halving the number each round
+	for len(chunks) > 1 {
+		newChunks := make([][]V12Record, (len(chunks)+1)/2)
+
+		var wg sync.WaitGroup
+		for i := 0; i < len(chunks); i += 2 {
+			idx := i / 2
+			if i+1 >= len(chunks) {
+				// Odd chunk, just copy
+				newChunks[idx] = chunks[i]
+				continue
+			}
+
+			wg.Add(1)
+			go func(idx int, left, right []V12Record) {
+				defer wg.Done()
+				newChunks[idx] = mergeTwoSorted(left, right)
+			}(idx, chunks[i], chunks[i+1])
+		}
+		wg.Wait()
+		chunks = newChunks
+	}
+
+	return chunks[0]
+}
+
+// mergeTwoSorted merges two sorted slices into one sorted slice.
+func mergeTwoSorted(a, b []V12Record) []V12Record {
+	result := make([]V12Record, 0, len(a)+len(b))
+	i, j := 0, 0
+
+	for i < len(a) && j < len(b) {
+		if bytes.Compare(a[i].Key[:], b[j].Key[:]) <= 0 {
+			result = append(result, a[i])
+			i++
+		} else {
+			result = append(result, b[j])
+			j++
+		}
+	}
+
+	// Append remaining elements
+	result = append(result, a[i:]...)
+	result = append(result, b[j:]...)
+
+	return result
 }
