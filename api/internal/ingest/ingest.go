@@ -23,14 +23,13 @@ type Pausable interface {
 
 // Config configures the ingest worker.
 type Config struct {
-	WatchDir       string         // Directory to watch for PGN files
-	ProcessedDir   string         // Directory to move processed files to
-	RatingMin      int            // Minimum rating filter
-	CheckFlushEvery int           // Check if flush needed every N games (default 1000)
-	DirtyMemLimit  int64          // Memory limit for dirty blocks (bytes), default 256MB
-	PollInterval   time.Duration  // How often to check for new files
-	Logger         zerolog.Logger // Logger
-	PauseDuring    []Pausable     // Components to pause during ingest
+	WatchDir        string         // Directory to watch for PGN files
+	ProcessedDir    string         // Directory to move processed files to
+	RatingMin       int            // Minimum rating filter
+	CheckFlushEvery int            // Check if flush needed every N games (default 1000)
+	PollInterval    time.Duration  // How often to check for new files
+	Logger          zerolog.Logger // Logger
+	PauseDuring     []Pausable     // Components to pause during ingest
 }
 
 // Worker watches a folder and ingests PGN files.
@@ -53,9 +52,6 @@ func NewWorker(cfg Config, ps store.IngestStore) (*Worker, error) {
 	}
 	if cfg.CheckFlushEvery == 0 {
 		cfg.CheckFlushEvery = 100 // Check every 100 games (~8k positions)
-	}
-	if cfg.DirtyMemLimit == 0 {
-		cfg.DirtyMemLimit = 256 * 1024 * 1024 // 256MB default
 	}
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 10 * time.Second
@@ -219,7 +215,7 @@ func (w *Worker) processNewFiles(ctx context.Context) error {
 
 	// Compact L0 -> L1 (merge and sort with best compression)
 	w.log.Info().Msg("compacting L0 -> L1...")
-	if err := w.ps.Compact(); err != nil {
+	if err := w.ps.CompactL0(); err != nil {
 		w.log.Error().Err(err).Msg("compaction failed")
 	}
 

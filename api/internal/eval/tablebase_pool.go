@@ -2,8 +2,11 @@ package eval
 
 import (
 	"context"
+	"encoding/csv"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +14,7 @@ import (
 
 	"github.com/freeeve/pgn/v3"
 	"github.com/freeeve/uci"
+	"github.com/klauspost/compress/zstd"
 	"github.com/rs/zerolog"
 
 	"github.com/freeeve/chessgraph/api/internal/store"
@@ -20,16 +24,16 @@ import (
 type TablebasePoolConfig struct {
 	StockfishPath   string
 	Logger          zerolog.Logger
-	Depth           int   // Stockfish search depth for eval
-	RefutationDepth int   // Stockfish search depth for refutation (0 = Depth + 10)
-	HashMB          int   // Stockfish hash table size per worker
-	Threads         int   // Stockfish threads per worker
-	Nice            int   // Nice value for Stockfish processes (0 = disabled)
-	NumWorkers      int   // Number of parallel Stockfish workers
-	QueueSize       int   // Size of the work queue
-	MaxDepth        int   // Maximum tree depth to explore
-	RefutationOnly  bool  // If true, skip DFS enumeration (only process browse/refutation queues)
-	DirtyMemLimit   int64 // Memory limit for dirty blocks (bytes), triggers flush when exceeded
+	Depth           int    // Stockfish search depth for eval
+	RefutationDepth int    // Stockfish search depth for refutation (0 = Depth + 10)
+	HashMB          int    // Stockfish hash table size per worker
+	Threads        int    // Stockfish threads per worker
+	Nice           int    // Nice value for Stockfish processes (0 = disabled)
+	NumWorkers     int    // Number of parallel Stockfish workers
+	QueueSize      int    // Size of the work queue
+	MaxDepth       int    // Maximum tree depth to explore
+	RefutationOnly bool   // If true, skip DFS enumeration (only process browse/refutation queues)
+	EvalLogPath    string // Path to CSV file for logging evaluations (empty = disabled)
 }
 
 // RefutationJob represents a position to prove with refutation analysis.
@@ -56,6 +60,15 @@ type TablebasePool struct {
 	// Worker control
 	activeWorkers int32 // atomic: number of workers that should be active (0 = paused)
 	maxWorkers    int32 // configured maximum workers
+
+	// Eval logging
+	evalLogFile       *os.File
+	evalLogZstdWriter *zstd.Encoder
+	evalLogWriter     *csv.Writer
+	evalLogMu         sync.Mutex
+
+	// In-memory eval cache (loaded from eval-log on startup)
+	evalCache *store.EvalCache
 
 	// Stats
 	evaluated        int64
@@ -94,7 +107,7 @@ func NewTablebasePool(cfg TablebasePoolConfig, ps store.WriteStore) (*TablebaseP
 		refuteDepth = cfg.Depth // Default: same as eval depth
 	}
 
-	return &TablebasePool{
+	pool := &TablebasePool{
 		cfg:             cfg,
 		log:             cfg.Logger,
 		ps:              ps,
@@ -104,7 +117,51 @@ func NewTablebasePool(cfg TablebasePoolConfig, ps store.WriteStore) (*TablebaseP
 		refutationDepth: refuteDepth,
 		activeWorkers:   int32(cfg.NumWorkers), // Start with all workers active
 		maxWorkers:      int32(cfg.NumWorkers),
-	}, nil
+		evalCache:       store.NewEvalCache(),
+	}
+
+	// Initialize eval log file if configured (zstd compressed)
+	if cfg.EvalLogPath != "" {
+		f, err := os.OpenFile(cfg.EvalLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("open eval log: %w", err)
+		}
+		pool.evalLogFile = f
+
+		// Use zstd compression
+		zstdWriter, err := zstd.NewWriter(f)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("create zstd writer: %w", err)
+		}
+		pool.evalLogZstdWriter = zstdWriter
+		pool.evalLogWriter = csv.NewWriter(zstdWriter)
+
+		// Write header if file is empty
+		info, _ := f.Stat()
+		if info.Size() == 0 {
+			if err := pool.evalLogWriter.Write([]string{"fen", "position", "cp", "dtm", "dtz", "proven_depth"}); err != nil {
+				zstdWriter.Close()
+				f.Close()
+				return nil, fmt.Errorf("write eval log header: %w", err)
+			}
+			pool.evalLogWriter.Flush()
+			zstdWriter.Flush()
+		}
+		cfg.Logger.Info().Str("path", cfg.EvalLogPath).Msg("eval logging enabled (zstd compressed)")
+
+		// Load existing evals into cache (async to not block startup)
+		go func(path string, log zerolog.Logger) {
+			count, err := pool.evalCache.LoadFromFile(path)
+			if err != nil {
+				log.Warn().Err(err).Msg("failed to load eval cache (starting fresh)")
+			} else {
+				log.Info().Int("count", count).Msg("loaded eval cache from log")
+			}
+		}(cfg.EvalLogPath, cfg.Logger)
+	}
+
+	return pool, nil
 }
 
 // EvalStatus represents the current status of the eval pool.
@@ -183,16 +240,163 @@ func (p *TablebasePool) EnqueueRefutation(job RefutationJob) bool {
 	}
 }
 
-// flushIfMemoryNeeded triggers an async flush if dirty memory exceeds the limit.
-func (p *TablebasePool) flushIfMemoryNeeded() {
-	if p.cfg.DirtyMemLimit > 0 {
-		p.ps.FlushIfMemoryNeededAsync(p.cfg.DirtyMemLimit)
+// MoveWithScore holds a UCI move and its evaluation.
+type MoveWithScore struct {
+	UCI   string // UCI move (e.g., "e2e4")
+	Score int16  // Centipawn score (from side to move's perspective)
+	Mate  int16  // Mate in N (positive = winning, negative = losing), 0 if not mate
+}
+
+// AnalyzeTopMoves uses Stockfish with MultiPV to find the top N moves for a position.
+// Returns the moves with their evaluations (from side to move's perspective).
+// Creates a temporary engine. Uses time-limited search (5 seconds) instead of pure depth.
+func (p *TablebasePool) AnalyzeTopMoves(fen string, numMoves int, searchDepth int) ([]MoveWithScore, error) {
+	engine, err := uci.NewEngine(p.cfg.StockfishPath)
+	if err != nil {
+		return nil, fmt.Errorf("create engine: %w", err)
+	}
+	defer engine.Close()
+
+	opts := uci.Options{
+		Hash:    256, // Larger hash for deep search
+		Threads: 4,
+		MultiPV: numMoves,
+		Ponder:  false,
+		OwnBook: false,
+	}
+	if err := engine.SetOptions(opts); err != nil {
+		return nil, fmt.Errorf("set options: %w", err)
+	}
+
+	if err := engine.SetFEN(fen); err != nil {
+		return nil, fmt.Errorf("set FEN: %w", err)
+	}
+
+	// Use depth-limited search for consistent MultiPV results
+	// HighestDepthOnly doesn't work well with MultiPV, so use depth limit instead
+	results, err := engine.Go(30, "", 0, 0) // depth 30 for consistent eval storage
+	if err != nil {
+		return nil, fmt.Errorf("search: %w", err)
+	}
+
+	// Collect best moves from each PV line with their scores
+	moves := make([]MoveWithScore, 0, numMoves)
+	seen := make(map[string]bool)
+	p.log.Debug().Int("result_count", len(results.Results)).Str("fen", fen).Msg("AnalyzeTopMoves: got results")
+	for _, r := range results.Results {
+		if len(r.BestMoves) > 0 {
+			move := r.BestMoves[0]
+			if !seen[move] {
+				seen[move] = true
+				ms := MoveWithScore{UCI: move}
+				if r.Mate {
+					ms.Mate = int16(r.Score)
+				} else {
+					ms.Score = int16(r.Score)
+				}
+				moves = append(moves, ms)
+			}
+		}
+	}
+
+	p.log.Debug().Int("moves", len(moves)).Str("fen", fen).Msg("AnalyzeTopMoves: returning")
+	return moves, nil
+}
+
+// LogEval writes an evaluation to the CSV log file (if configured).
+// Also updates the in-memory eval cache for fast lookups.
+// Exported so external code (like deep-eval) can also log evaluations.
+func (p *TablebasePool) LogEval(fen string, packed pgn.PackedPosition, record *store.PositionRecord) {
+	// Always update the in-memory cache
+	var key [store.KeySize]byte
+	copy(key[:], packed[:])
+	p.evalCache.Put(key, store.EvalData{
+		CP:          record.CP,
+		DTM:         record.DTM,
+		DTZ:         record.DTZ,
+		ProvenDepth: record.GetProvenDepth(),
+		HasCP:       record.HasCP(),
+	})
+
+	if p.evalLogWriter == nil {
+		return
+	}
+
+	p.evalLogMu.Lock()
+	defer p.evalLogMu.Unlock()
+
+	row := []string{
+		fen,
+		packed.String(),
+		strconv.Itoa(int(record.CP)),
+		strconv.Itoa(int(record.DTM)),
+		strconv.Itoa(int(record.DTZ)),
+		strconv.Itoa(int(record.GetProvenDepth())),
+	}
+
+	if err := p.evalLogWriter.Write(row); err != nil {
+		p.log.Warn().Err(err).Msg("failed to write eval log")
+		return
+	}
+	p.evalLogWriter.Flush()
+
+	// Complete zstd frame and sync after every write
+	// Evals take seconds each, so this overhead is negligible
+	if p.evalLogZstdWriter != nil {
+		p.evalLogZstdWriter.Close()
+		p.evalLogFile.Sync()
+
+		// Create new encoder for next write
+		newEncoder, err := zstd.NewWriter(p.evalLogFile)
+		if err != nil {
+			p.log.Warn().Err(err).Msg("failed to recreate zstd encoder")
+			return
+		}
+		p.evalLogZstdWriter = newEncoder
+		p.evalLogWriter = csv.NewWriter(newEncoder)
 	}
 }
 
 // RefutationQueueLen returns the current length of the refutation queue.
 func (p *TablebasePool) RefutationQueueLen() int {
 	return len(p.refutationQueue)
+}
+
+// GetEval retrieves eval data from the in-memory cache.
+func (p *TablebasePool) GetEval(key [store.KeySize]byte) (store.EvalData, bool) {
+	return p.evalCache.Get(key)
+}
+
+// EvalCacheLen returns the number of cached evaluations.
+func (p *TablebasePool) EvalCacheLen() int {
+	return p.evalCache.Len()
+}
+
+// EvalCache returns the eval cache for sharing with other components.
+func (p *TablebasePool) EvalCache() *store.EvalCache {
+	return p.evalCache
+}
+
+// CloseEvalLog flushes and closes the eval log file.
+// Safe to call multiple times or if eval log is not enabled.
+func (p *TablebasePool) CloseEvalLog() {
+	if p.evalLogFile == nil {
+		return
+	}
+	p.evalLogMu.Lock()
+	defer p.evalLogMu.Unlock()
+
+	if p.evalLogWriter != nil {
+		p.evalLogWriter.Flush()
+	}
+	if p.evalLogZstdWriter != nil {
+		p.evalLogZstdWriter.Close()
+		p.evalLogZstdWriter = nil
+	}
+	if p.evalLogFile != nil {
+		p.evalLogFile.Close()
+		p.evalLogFile = nil
+	}
 }
 
 // Run starts the pool with one enumerator and N workers.
@@ -235,6 +439,22 @@ func (p *TablebasePool) Run(ctx context.Context) error {
 
 	// Trigger async flush (main shutdown will do final sync flush with metadata refresh)
 	p.ps.FlushAllAsync()
+
+	// Close eval log file
+	if p.evalLogFile != nil {
+		p.evalLogMu.Lock()
+		if p.evalLogWriter != nil {
+			p.evalLogWriter.Flush()
+		}
+		if p.evalLogZstdWriter != nil {
+			p.evalLogZstdWriter.Close()
+			p.evalLogZstdWriter = nil
+		}
+		p.evalLogFile.Sync() // Ensure completed frame is on disk
+		p.evalLogFile.Close()
+		p.evalLogFile = nil
+		p.evalLogMu.Unlock()
+	}
 
 	p.log.Info().
 		Int64("total_evaluated", atomic.LoadInt64(&p.evaluated)).
@@ -495,7 +715,6 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 					Int("queue_remaining", p.browseQueue.Len()).
 					Msg("browse eval complete")
 			}
-			p.flushIfMemoryNeeded()
 			continue
 		}
 
@@ -512,7 +731,6 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 					atomic.AddInt64(&p.matesProved, 1)
 				}
 			}
-			p.flushIfMemoryNeeded()
 			continue
 		default:
 		}
@@ -530,7 +748,6 @@ func (p *TablebasePool) runWorker(ctx context.Context, workerID int) {
 			if err := p.evaluatePosition(ctx, engine, packed, log); err != nil {
 				log.Warn().Err(err).Msg("eval failed")
 			}
-			p.flushIfMemoryNeeded()
 		default:
 			// No work available, wait a bit
 			time.Sleep(100 * time.Millisecond)
@@ -600,6 +817,9 @@ func (p *TablebasePool) evaluatePosition(ctx context.Context, engine *uci.Engine
 	if err := p.ps.Put(packed, record); err != nil {
 		return fmt.Errorf("put position: %w", err)
 	}
+
+	// Log evaluation to CSV
+	p.LogEval(fen, packed, record)
 
 	atomic.AddInt64(&p.evaluated, 1)
 

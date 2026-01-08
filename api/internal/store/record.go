@@ -6,9 +6,46 @@ import (
 	"github.com/freeeve/chessgraph/api/internal/graph"
 )
 
-// PositionRecord is the simplified storage format for a chess position.
-// All data for a position is stored in a single 16-byte record.
-// Key: raw posKey (34 bytes), no prefix needed.
+// Key and record size constants
+const (
+	KeySize    = 26 // Position key size in bytes
+	ValueSize  = 14 // PositionRecord size in bytes
+	RecordSize = KeySize + ValueSize
+)
+
+// File size limits for L1 and L2 (uncompressed)
+const (
+	L1MinFileSize = 128 * 1024 * 1024 // 128MB - L1 target minimum
+	L1MaxFileSize = 256 * 1024 * 1024 // 256MB - L1 split threshold
+
+	L2MinFileSize = 1024 * 1024 * 1024 // 1GB - L2 target minimum
+	L2MaxFileSize = 2048 * 1024 * 1024 // 2GB - L2 split threshold
+)
+
+// L2 compaction triggers
+//
+// Memory budget: L1→L2 compaction loads all L1 files into memory because
+// the V13 format uses striped arrays with prefix compression (can't stream).
+// 32 files × 128MB = ~4GB RAM during L1→L2 compaction.
+const (
+	L1CompactThreshold = 32 // Compact L1→L2 when L1 has this many files (~4GB uncompressed)
+	L1MaxFilesPerBatch = 32 // Process all to produce ~1GB compressed L2 data file
+)
+
+// Backwards compatibility aliases (deprecated, use KeySize/ValueSize/RecordSize)
+const (
+	V12KeySize    = KeySize
+	V12ValueSize  = ValueSize
+	V12RecordSize = RecordSize
+)
+
+// MaxWDLCount is the maximum value for wins/draws/losses counters.
+// Once ANY counter hits this value, we stop incrementing ALL of them
+// to preserve accurate win/draw/loss ratios.
+const MaxWDLCount uint16 = 65535
+
+// PositionRecord is the storage format for a chess position.
+// All data for a position is stored in a single 14-byte record.
 type PositionRecord struct {
 	Wins        uint16 // Win count (caps at 65535)
 	Draws       uint16 // Draw count (caps at 65535)
@@ -19,37 +56,32 @@ type PositionRecord struct {
 	ProvenDepth uint16 // Propagated proven depth
 }
 
-const positionRecordSize = 14
+// Record is a key-value pair (position key + record)
+type Record struct {
+	Key   [KeySize]byte
+	Value PositionRecord
+}
 
+// ProvenDepth flag bits
 const (
-	// ProvenDepth flag bits
 	// Bit 15 (0x8000): HasCP flag - set when position has been evaluated
 	// Bits 0-14: actual proven depth value (0-32767)
 	ProvenDepthHasCPFlag uint16 = 0x8000
-	ProvenDepthMask      uint16 = 0x7FFF // Mask for actual depth value
+	ProvenDepthMask      uint16 = 0x7FFF
+)
 
+// DTM encoding constants
+const (
 	DTMUnknown       int16 = 0
 	DTMDrawBase      int16 = -32768
 	DTMDrawThreshold int16 = -16385
-
-	// Normal mate distances are clamped to +/-16384 by EncodeMate.
-	DTMMateMax int16 = 16384
+	DTMMateMax       int16 = 16384
 
 	DTMMate0White int16 = 32767 // side-to-move is white and is checkmated
 	DTMMate0Black int16 = 32766 // side-to-move is black and is checkmated
 )
 
-func IsMate0(dtm int16) bool {
-	return dtm == DTMMate0White || dtm == DTMMate0Black
-}
-
-func IsMate(dtm int16) bool {
-	if IsMate0(dtm) {
-		return true
-	}
-	return (dtm > 0 && dtm <= DTMMateMax) || (dtm < 0 && dtm > DTMDrawThreshold)
-}
-
+// MateKind indicates the type of mate/draw result
 type MateKind uint8
 
 const (
@@ -59,7 +91,20 @@ const (
 	MateDraw
 )
 
-// DecodeMate interprets r.DTM into a (kind, distance).
+// IsMate0 returns true if DTM indicates immediate checkmate
+func IsMate0(dtm int16) bool {
+	return dtm == DTMMate0White || dtm == DTMMate0Black
+}
+
+// IsMate returns true if DTM indicates a mate (win or loss)
+func IsMate(dtm int16) bool {
+	if IsMate0(dtm) {
+		return true
+	}
+	return (dtm > 0 && dtm <= DTMMateMax) || (dtm < 0 && dtm > DTMDrawThreshold)
+}
+
+// DecodeMate interprets DTM into a (kind, distance).
 // distance is:
 // - mate: number of moves to mate (0 for mate-in-0 sentinel)
 // - draw: distance to draw (0..16383)
@@ -70,10 +115,8 @@ func DecodeMate(dtm int16) (MateKind, int16) {
 		return MateUnknown, 0
 
 	case IsMate0(dtm):
-		// Side-to-move is mated now
 		return MateLoss, 0
 
-	// Normal mate encodings (keep the original intended range)
 	case dtm > 0 && dtm <= 16384:
 		return MateWin, dtm
 
@@ -81,11 +124,9 @@ func DecodeMate(dtm int16) (MateKind, int16) {
 		return MateLoss, -dtm
 
 	case dtm <= DTMDrawThreshold:
-		// Draw distance: dtm - (-32768) => dtm + 32768
 		return MateDraw, int16(dtm - DTMDrawBase)
 
 	default:
-		// Out-of-range / corrupted / reserved
 		return MateUnknown, 0
 	}
 }
@@ -108,21 +149,22 @@ func DecodeDTM(dtm int16) (MateKind, int16) {
 	}
 }
 
+// IsProvenDraw returns true if this position is a proven draw
 func (r *PositionRecord) IsProvenDraw() bool {
 	return r.DTM <= DTMDrawThreshold
 }
 
+// IsProven returns true if this position has proven outcome
 func (r *PositionRecord) IsProven() bool {
 	return r.DTM != DTMUnknown
 }
 
-// IsProvenWin returns true if this position is proven winning (we deliver mate).
+// IsProvenWin returns true if this position is proven winning (we deliver mate)
 func (r *PositionRecord) IsProvenWin() bool {
-	// Exclude mate0 sentinels: mate0 means side-to-move is mated (loss).
 	return r.DTM > 0 && r.DTM <= DTMMateMax
 }
 
-// IsProvenLoss returns true if this position is proven losing (we get mated).
+// IsProvenLoss returns true if this position is proven losing (we get mated)
 func (r *PositionRecord) IsProvenLoss() bool {
 	if IsMate0(r.DTM) {
 		return true
@@ -130,8 +172,7 @@ func (r *PositionRecord) IsProvenLoss() bool {
 	return r.DTM < 0 && r.DTM > DTMDrawThreshold
 }
 
-// MateDistance returns the mate distance (always positive), or 0 if no mate.
-// Note: mate0 returns 0, but IsMate(r.DTM) will still be true.
+// MateDistance returns the mate distance (always positive), or 0 if no mate
 func (r *PositionRecord) MateDistance() int {
 	if IsMate0(r.DTM) {
 		return 0
@@ -145,15 +186,15 @@ func (r *PositionRecord) MateDistance() int {
 	return 0
 }
 
-// DrawDistance returns the distance to draw (in moves), or 0 if not a draw.
+// DrawDistance returns the distance to draw (in moves), or 0 if not a draw
 func (r *PositionRecord) DrawDistance() int {
 	if r.DTM <= DTMDrawThreshold {
-		return int(r.DTM - DTMDrawBase) // DTM + 32768
+		return int(r.DTM - DTMDrawBase)
 	}
 	return 0
 }
 
-// EncodeDraw returns the DTM value for a draw at the given distance.
+// EncodeDraw returns the DTM value for a draw at the given distance
 func EncodeDraw(distance int) int16 {
 	if distance < 0 {
 		distance = 0
@@ -176,6 +217,7 @@ func EncodeMate(distance int) int16 {
 	return int16(distance)
 }
 
+// EncodeMateLoss0 returns the DTM value for immediate checkmate
 func EncodeMateLoss0(whiteToMove bool) int16 {
 	if whiteToMove {
 		return DTMMate0White
@@ -183,27 +225,50 @@ func EncodeMateLoss0(whiteToMove bool) int16 {
 	return DTMMate0Black
 }
 
-// encodePositionRecord encodes a PositionRecord to 14 bytes.
-func encodePositionRecord(r PositionRecord) []byte {
-	buf := make([]byte, positionRecordSize)
-	// 0..6: W/D/L
+// Count returns the total game count (wins + draws + losses)
+func (r *PositionRecord) Count() uint32 {
+	return uint32(r.Wins) + uint32(r.Draws) + uint32(r.Losses)
+}
+
+// HasCP returns true if the record has a valid CP evaluation
+func (r *PositionRecord) HasCP() bool {
+	return r.ProvenDepth&ProvenDepthHasCPFlag != 0
+}
+
+// SetHasCP sets the HasCP flag in ProvenDepth
+func (r *PositionRecord) SetHasCP(hasCP bool) {
+	if hasCP {
+		r.ProvenDepth |= ProvenDepthHasCPFlag
+	} else {
+		r.ProvenDepth &= ProvenDepthMask
+	}
+}
+
+// GetProvenDepth returns the actual proven depth value (without flag bits)
+func (r *PositionRecord) GetProvenDepth() uint16 {
+	return r.ProvenDepth & ProvenDepthMask
+}
+
+// SetProvenDepth sets the proven depth value while preserving flag bits
+func (r *PositionRecord) SetProvenDepth(depth uint16) {
+	r.ProvenDepth = (r.ProvenDepth & ProvenDepthHasCPFlag) | (depth & ProvenDepthMask)
+}
+
+// EncodeRecord encodes a PositionRecord to 14 bytes
+func EncodeRecord(r PositionRecord) []byte {
+	buf := make([]byte, ValueSize)
 	binary.BigEndian.PutUint16(buf[0:2], r.Wins)
 	binary.BigEndian.PutUint16(buf[2:4], r.Draws)
 	binary.BigEndian.PutUint16(buf[4:6], r.Losses)
-	// 6..10: CP, DTM
 	binary.BigEndian.PutUint16(buf[6:8], uint16(r.CP))
 	binary.BigEndian.PutUint16(buf[8:10], uint16(r.DTM))
-	// 10..14: DTZ, ProvenDepth
 	binary.BigEndian.PutUint16(buf[10:12], r.DTZ)
 	binary.BigEndian.PutUint16(buf[12:14], r.ProvenDepth)
 	return buf
 }
 
-// decodePositionRecord decodes 14 bytes into a PositionRecord.
-func decodePositionRecord(data []byte) PositionRecord {
-	// Optional defensive check (keep if you want):
-	// if len(data) < positionRecordSize { panic("short position record") }
-
+// DecodeRecord decodes 14 bytes into a PositionRecord
+func DecodeRecord(data []byte) PositionRecord {
 	return PositionRecord{
 		Wins:        binary.BigEndian.Uint16(data[0:2]),
 		Draws:       binary.BigEndian.Uint16(data[2:4]),
@@ -215,13 +280,13 @@ func decodePositionRecord(data []byte) PositionRecord {
 	}
 }
 
-// positionKey returns the raw position key (no prefix).
-func positionKey(posKey graph.PositionKey) []byte {
+// PositionKey converts a graph.PositionKey to the raw key bytes
+func PositionKey(posKey graph.PositionKey) []byte {
 	return posKey[:]
 }
 
-// saturatingAdd16 adds two uint16 values, capping at 65535.
-func saturatingAdd16(a, b uint16) uint16 {
+// SaturatingAdd16 adds two uint16 values, capping at 65535
+func SaturatingAdd16(a, b uint16) uint16 {
 	sum := uint32(a) + uint32(b)
 	if sum > 65535 {
 		return 65535
@@ -229,8 +294,8 @@ func saturatingAdd16(a, b uint16) uint16 {
 	return uint16(sum)
 }
 
-// saturatingAddSigned16 adds a signed delta to uint16, capping at 0 and 65535.
-func saturatingAddSigned16(a uint16, delta int32) uint16 {
+// SaturatingAddSigned16 adds a signed delta to uint16, capping at 0 and 65535
+func SaturatingAddSigned16(a uint16, delta int32) uint16 {
 	sum := int32(a) + delta
 	if sum < 0 {
 		return 0
@@ -239,33 +304,4 @@ func saturatingAddSigned16(a uint16, delta int32) uint16 {
 		return 65535
 	}
 	return uint16(sum)
-}
-
-func (r *PositionRecord) Count() uint32 {
-	return uint32(r.Wins) + uint32(r.Draws) + uint32(r.Losses)
-}
-
-// HasCP returns true if the record has a valid CP evaluation.
-// Uses the high bit of ProvenDepth as the "evaluated" flag.
-func (r *PositionRecord) HasCP() bool {
-	return r.ProvenDepth&ProvenDepthHasCPFlag != 0
-}
-
-// SetHasCP sets the HasCP flag in ProvenDepth.
-func (r *PositionRecord) SetHasCP(hasCP bool) {
-	if hasCP {
-		r.ProvenDepth |= ProvenDepthHasCPFlag
-	} else {
-		r.ProvenDepth &= ProvenDepthMask
-	}
-}
-
-// GetProvenDepth returns the actual proven depth value (without flag bits).
-func (r *PositionRecord) GetProvenDepth() uint16 {
-	return r.ProvenDepth & ProvenDepthMask
-}
-
-// SetProvenDepth sets the proven depth value while preserving flag bits.
-func (r *PositionRecord) SetProvenDepth(depth uint16) {
-	r.ProvenDepth = (r.ProvenDepth & ProvenDepthHasCPFlag) | (depth & ProvenDepthMask)
 }

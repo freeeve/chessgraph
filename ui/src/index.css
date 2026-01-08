@@ -57,8 +57,8 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  min-width: 220px;
-  max-width: 250px;
+  min-width: 320px;
+  max-width: 380px;
   height: 320px; /* Match move-history height */
 }
 
@@ -151,61 +151,81 @@ h1 {
 
 .controls-group {
   display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
+  flex-direction: row;
+  gap: 0.5rem;
   background: rgba(255, 255, 255, 0.05);
   border-radius: 6px;
-  padding: 0.5rem;
+  padding: 0.4rem 0.5rem;
   flex-shrink: 0;
-}
-
-.control-row {
-  display: flex;
-  justify-content: space-between;
   align-items: center;
-  gap: 0.5rem;
-  font-size: 0.8rem;
+  flex-wrap: wrap;
 }
 
-.control-row label {
+.control-item {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.7rem;
+}
+
+.control-item label {
   color: rgba(255, 255, 255, 0.7);
 }
 
-.control-row select {
+.control-item select {
   background: rgba(255, 255, 255, 0.1);
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 4px;
   color: rgba(255, 255, 255, 0.9);
-  padding: 0.2rem 0.4rem;
-  font-size: 0.8rem;
+  padding: 0.15rem 0.3rem;
+  font-size: 0.7rem;
   cursor: pointer;
 }
 
-.control-row select:hover {
+.control-item select:hover {
   background: rgba(255, 255, 255, 0.15);
 }
 
-.control-row select:focus {
+.control-item select:focus {
   outline: none;
   border-color: #64b5f6;
 }
 
 /* FEN Input button */
-.fen-btn {
-  width: 100%;
+.fen-btn,.pgn-btn {
   background: rgba(100, 181, 246, 0.2);
   border: 1px solid rgba(100, 181, 246, 0.4);
   border-radius: 4px;
   color: #64b5f6;
-  padding: 0.3rem 0.5rem;
-  font-size: 0.75rem;
+  padding: 0.15rem 0.4rem;
+  font-size: 0.7rem;
   cursor: pointer;
-  margin-top: 0.25rem;
   transition: background 0.15s;
+  margin-right: 5px;
 }
 
 .fen-btn:hover {
   background: rgba(100, 181, 246, 0.3);
+}
+
+.deep-eval-btn {
+  background: rgba(156, 39, 176, 0.2);
+  border: 1px solid rgba(156, 39, 176, 0.4);
+  border-radius: 4px;
+  color: #ba68c8;
+  padding: 0.15rem 0.4rem;
+  font-size: 0.7rem;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.deep-eval-btn:hover:not(:disabled) {
+  background: rgba(156, 39, 176, 0.3);
+}
+
+.deep-eval-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 /* FEN Dialog */
@@ -434,10 +454,10 @@ h1 {
   background: rgba(255, 255, 255, 0.05);
   border-radius: 8px;
   padding: 0.5rem;
-  min-width: 180px;
-  max-width: 220px;
+  width: 230px;
   height: 320px;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .all-moves-title {
@@ -454,17 +474,42 @@ h1 {
   gap: 0.25rem;
 }
 
+.all-moves-header {
+  display: grid;
+  grid-template-columns: 1.6rem 2.2rem 2.2rem 1fr;
+  gap: 0.2rem;
+  font-size: 0.55rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.5);
+  text-transform: uppercase;
+  padding: 0.15rem 0.3rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  margin-bottom: 0.25rem;
+}
+
 .all-moves-row {
   display: grid;
-  grid-template-columns: 1.8rem 2.5rem 2.8rem 1fr;
-  gap: 0.3rem;
+  grid-template-columns: 1.6rem 2.2rem 2.2rem 1fr;
+  gap: 0.2rem;
   align-items: center;
-  font-size: 0.7rem;
+  font-size: 0.65rem;
   font-family: monospace;
-  padding: 0.2rem 0.4rem;
+  padding: 0.15rem 0.3rem;
   border-radius: 4px;
   cursor: pointer;
   transition: background 0.15s;
+}
+
+.move-bar {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.move-bar .win-bar {
+  margin-top: 0;
+  height: 12px;
+  font-size: 0.45rem;
 }
 
 .all-moves-row:hover {
@@ -492,24 +537,6 @@ h1 {
   color: rgba(255, 255, 255, 0.6);
   font-size: 0.75rem;
   text-align: right;
-}
-
-.move-wdl {
-  display: flex;
-  gap: 0.25rem;
-  font-size: 0.7rem;
-}
-
-.move-wdl .w {
-  color: #81c784;
-}
-
-.move-wdl .d {
-  color: rgba(255, 255, 255, 0.5);
-}
-
-.move-wdl .l {
-  color: #e57373;
 }
 
 /* Container for all-moves panel and hover preview */
@@ -638,6 +665,14 @@ h1 {
   gap: 0.5rem;
 }
 
+.game-count {
+  font-size: 0.65rem;
+  color: rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.1);
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+}
+
 .move-eval-inline {
   font-size: 0.7rem;
   font-weight: bold;
@@ -750,6 +785,36 @@ h1 {
   padding: 1rem;
 }
 
+.error-banner {
+  background: rgba(255, 107, 107, 0.15);
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  color: #ff6b6b;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.85rem;
+  width: 100%;
+  max-width: 800px;
+}
+
+.error-dismiss {
+  background: none;
+  border: none;
+  color: #ff6b6b;
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0 0.25rem;
+  line-height: 1;
+}
+
+.error-dismiss:hover {
+  color: #ff9999;
+}
+
 .config-panel {
   display: flex;
   gap: 1rem;
@@ -774,14 +839,49 @@ h1 {
 }
 
 .win-bar {
-  height: 4px;
+  height: 16px;
   width: 100%;
   background: linear-gradient(to right,
-    #4caf50 var(--win-pct),
-    #9e9e9e var(--win-pct) var(--draw-end),
-    #f44336 var(--draw-end));
+    #ffffff var(--win-pct),
+    #808080 var(--win-pct) var(--draw-end),
+    #1a1a1a var(--draw-end));
   border-radius: 2px;
   margin-top: 0.25rem;
+  position: relative;
+  font-size: 0.55rem;
+  font-weight: 600;
+}
+
+.win-bar.compact {
+  height: 8px;
+}
+
+.win-bar .bar-label {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 1;
+}
+
+.win-bar .bar-label.win {
+  left: 2px;
+  color: #1a1a1a;
+}
+
+.win-bar .bar-label.draw {
+  left: var(--draw-center);
+  transform: translate(-50%, -50%);
+  color: #1a1a1a;
+  text-shadow:
+    -1px -1px 0 #fff,
+    1px -1px 0 #fff,
+    -1px 1px 0 #fff,
+    1px 1px 0 #fff;
+}
+
+.win-bar .bar-label.loss {
+  right: 2px;
+  color: #ffffff;
 }
 
 .board-info .eval {
@@ -799,6 +899,16 @@ h1 {
   padding: 0.5rem 1rem;
   border-radius: 4px;
   font-size: 0.9rem;
+}
+
+.loading-indicator {
+  background: rgba(100, 181, 246, 0.15);
+  border: 1px solid rgba(100, 181, 246, 0.3);
+  color: #64b5f6;
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  margin-top: 0.5rem;
 }
 
 /* Subtle transitioning indicator - thin bar at top */

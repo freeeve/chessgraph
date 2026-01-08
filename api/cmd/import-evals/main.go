@@ -8,15 +8,17 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/freeeve/chessgraph/api/internal/graph"
 	"github.com/freeeve/chessgraph/api/internal/store"
+	"github.com/klauspost/compress/zstd"
 )
 
 func main() {
 	var (
 		positionStoreDir = flag.String("position-store", "./data/positions", "Position store directory")
-		inputPath        = flag.String("input", "evals.csv", "Input CSV file")
+		inputPath        = flag.String("input", "./data/evals.csv.zst", "Input CSV file (supports .zst compression)")
 		createMissing    = flag.Bool("create-missing", true, "Create position records if they don't exist")
 	)
 	flag.Parse()
@@ -44,7 +46,20 @@ func main() {
 	}
 	defer inFile.Close()
 
-	reader := csv.NewReader(inFile)
+	// Use zstd decompression if file ends with .zst
+	var csvReader io.Reader = inFile
+	if strings.HasSuffix(*inputPath, ".zst") {
+		// Use IgnoreChecksum to handle potentially truncated files from killed processes
+		zstdReader, err := zstd.NewReader(inFile, zstd.IgnoreChecksum(true))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create zstd reader: %v\n", err)
+			os.Exit(1)
+		}
+		defer zstdReader.Close()
+		csvReader = zstdReader
+	}
+
+	reader := csv.NewReader(csvReader)
 
 	// Read header
 	header, err := reader.Read()
@@ -79,16 +94,26 @@ func main() {
 	provenDepthCol := positionCol + 4
 	minCols := positionCol + 5
 
+	var consecutiveErrors int
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "read row: %v\n", err)
+			consecutiveErrors++
+			// For truncated zstd files, we get repeated "unexpected EOF" - bail after a few
+			if consecutiveErrors == 1 {
+				fmt.Fprintf(os.Stderr, "read row: %v\n", err)
+			}
+			if consecutiveErrors >= 3 {
+				fmt.Fprintf(os.Stderr, "too many consecutive errors, stopping (file may be truncated)\n")
+				break
+			}
 			errors++
 			continue
 		}
+		consecutiveErrors = 0
 
 		if len(row) < minCols {
 			errors++

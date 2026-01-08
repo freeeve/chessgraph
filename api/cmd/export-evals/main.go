@@ -9,12 +9,13 @@ import (
 
 	"github.com/freeeve/chessgraph/api/internal/graph"
 	"github.com/freeeve/chessgraph/api/internal/store"
+	"github.com/klauspost/compress/zstd"
 )
 
 func main() {
 	var (
 		positionStoreDir = flag.String("position-store", "./data/positions", "Position store directory")
-		outputPath       = flag.String("output", "evals.csv", "Output CSV file")
+		outputPath       = flag.String("output", "./data/evals.csv.zst", "Output CSV file (zstd compressed)")
 	)
 	flag.Parse()
 
@@ -36,7 +37,7 @@ func main() {
 	stats := v12.Stats()
 	fmt.Printf("Store stats: %d positions\n", stats.TotalPositions)
 
-	// Create output file
+	// Create output file with zstd compression
 	outFile, err := os.Create(*outputPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create output file: %v\n", err)
@@ -44,7 +45,14 @@ func main() {
 	}
 	defer outFile.Close()
 
-	writer := csv.NewWriter(outFile)
+	zstdWriter, err := zstd.NewWriter(outFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create zstd writer: %v\n", err)
+		os.Exit(1)
+	}
+	defer zstdWriter.Close()
+
+	writer := csv.NewWriter(zstdWriter)
 	defer writer.Flush()
 
 	// Write header
@@ -55,7 +63,7 @@ func main() {
 
 	var positionsChecked, evalsFound uint64
 
-	fmt.Printf("Scanning all L1 files...\n")
+	fmt.Printf("Scanning all L0 and L1 files...\n")
 
 	// Iterate all records
 	err = v12.IterateAll(func(key [store.V12KeySize]byte, rec *store.PositionRecord) bool {

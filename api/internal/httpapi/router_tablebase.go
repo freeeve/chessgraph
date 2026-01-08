@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/pprof"
 	"sort"
@@ -46,12 +47,14 @@ func NewRouter(log zerolog.Logger, ps store.ReadStore, evalPool *eval.TablebaseP
 	mux.Handle("/healthz", http.HandlerFunc(h.health))
 	mux.Handle("/readyz", http.HandlerFunc(h.health))
 	mux.Handle("/v1/position/", http.HandlerFunc(h.position))
+	mux.Handle("/v1/position-stats/", http.HandlerFunc(h.positionStats))
 	mux.Handle("/v1/tree", http.HandlerFunc(h.tree))
 	mux.Handle("/v1/tree/", http.HandlerFunc(h.tree))
 	mux.Handle("/v1/fen", http.HandlerFunc(h.fenLookup))
 	mux.Handle("/v1/stats", http.HandlerFunc(h.stats))
 	mux.Handle("/v1/eval/status", http.HandlerFunc(h.evalStatus))
 	mux.Handle("/v1/eval/workers", http.HandlerFunc(h.evalWorkers))
+	mux.Handle("/v1/deep-eval/", http.HandlerFunc(h.deepEval))
 
 	// pprof endpoints
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -71,22 +74,83 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	stats := h.ps.Stats()
+
+	// Calculate derived stats
+	var l1BitsPerPos, l1BytesPerPos, l0BytesPerPos, l2BytesPerPos float64
+	var l1CompressRatio, l0CompressRatio, l2CompressRatio float64
+
+	// Memtable bytes per pos is a constant (key + value size)
+	memBytesPerPos := float64(store.V12RecordSize)
+
+	if stats.L1Positions > 0 {
+		l1BitsPerPos = float64(stats.L1CompressedBytes*8) / float64(stats.L1Positions)
+		l1BytesPerPos = float64(stats.L1CompressedBytes) / float64(stats.L1Positions)
+	}
+	if stats.L0Positions > 0 {
+		l0BytesPerPos = float64(stats.L0CompressedBytes) / float64(stats.L0Positions)
+	}
+	if stats.L2Positions > 0 {
+		l2BytesPerPos = float64(stats.L2CompressedBytes) / float64(stats.L2Positions)
+	}
+	if stats.L1UncompressedBytes > 0 {
+		l1CompressRatio = float64(stats.L1UncompressedBytes) / float64(stats.L1CompressedBytes)
+	}
+	if stats.L0UncompressedBytes > 0 {
+		l0CompressRatio = float64(stats.L0UncompressedBytes) / float64(stats.L0CompressedBytes)
+	}
+	if stats.L2UncompressedBytes > 0 {
+		l2CompressRatio = float64(stats.L2UncompressedBytes) / float64(stats.L2CompressedBytes)
+	}
+
 	writeJSON(w, map[string]any{
 		"total_reads":         stats.TotalReads,
 		"total_writes":        stats.TotalWrites,
-		"l0_files":            stats.DirtyFiles,
-		"l1_files":            stats.TotalFolders,
-		"total_blocks":        stats.TotalBlocks,
-		"cached_blocks":       stats.CachedBlocks,
 		"read_only":           h.ps.IsReadOnly(),
 		"total_positions":     stats.TotalPositions,
 		"evaluated_positions": stats.EvaluatedPositions,
 		"cp_positions":        stats.CPPositions,
 		"dtm_positions":       stats.DTMPositions,
 		"dtz_positions":       stats.DTZPositions,
-		"uncompressed_bytes":  stats.UncompressedBytes,
-		"compressed_bytes":    stats.CompressedBytes,
 		"total_games":         stats.TotalGames,
+
+		// Memtable stats
+		"memtable_positions": stats.MemtablePositions,
+		"memtable_bytes":     stats.MemtableBytes,
+		"memtable_bytes_per_pos": memBytesPerPos,
+
+		// L0 stats
+		"l0_files":             stats.L0Files,
+		"l0_positions":         stats.L0Positions,
+		"l0_uncompressed_bytes": stats.L0UncompressedBytes,
+		"l0_compressed_bytes":  stats.L0CompressedBytes,
+		"l0_cached_files":      stats.L0CachedFiles,
+		"l0_bytes_per_pos":     l0BytesPerPos,
+		"l0_compress_ratio":    l0CompressRatio,
+
+		// L1 stats
+		"l1_files":             stats.L1Files,
+		"l1_positions":         stats.L1Positions,
+		"l1_uncompressed_bytes": stats.L1UncompressedBytes,
+		"l1_compressed_bytes":  stats.L1CompressedBytes,
+		"l1_cached_files":      stats.L1CachedFiles,
+		"l1_bits_per_pos":      l1BitsPerPos,
+		"l1_bytes_per_pos":     l1BytesPerPos,
+		"l1_compress_ratio":    l1CompressRatio,
+
+		// L2 stats
+		"l2_files":             stats.L2Files,
+		"l2_positions":         stats.L2Positions,
+		"l2_uncompressed_bytes": stats.L2UncompressedBytes,
+		"l2_compressed_bytes":  stats.L2CompressedBytes,
+		"l2_cached_files":      stats.L2CachedFiles,
+		"l2_bytes_per_pos":     l2BytesPerPos,
+		"l2_compress_ratio":    l2CompressRatio,
+
+		// Legacy (for backwards compatibility)
+		"uncompressed_bytes": stats.UncompressedBytes,
+		"compressed_bytes":   stats.CompressedBytes,
+		"total_blocks":       stats.TotalBlocks,
+		"cached_blocks":      stats.CachedBlocks,
 	})
 }
 
@@ -224,6 +288,106 @@ func (h *Handler) position(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
+// PositionStatsResponse is a lightweight response with just position stats (no child moves)
+type PositionStatsResponse struct {
+	Position    string  `json:"position"`               // Base64 position key
+	FEN         string  `json:"fen"`                    // FEN string (for hover preview)
+	Count       uint32  `json:"count"`                  // Total games
+	Wins        uint32  `json:"wins"`                   // Wins for side to move
+	Draws       uint32  `json:"draws"`                  // Draws
+	Losses      uint32  `json:"losses"`                 // Losses for side to move
+	WinPct      float64 `json:"win_pct"`                // Win percentage (0-100)
+	DrawPct     float64 `json:"draw_pct"`               // Draw percentage (0-100)
+	CP          int16   `json:"cp,omitempty"`           // Centipawn evaluation
+	DTM         int16   `json:"dtm,omitempty"`          // Distance to mate (+ = win, - = loss)
+	ProvenDepth uint16  `json:"proven_depth,omitempty"` // Depth at which eval was proven
+	HasEval     bool    `json:"has_eval"`               // Whether position has been evaluated
+}
+
+// positionStats returns just stats for a position (fast, for async loading)
+func (h *Handler) positionStats(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	parts := splitPath(r.URL.Path)
+	if len(parts) < 3 {
+		http.Error(w, "missing position key", http.StatusBadRequest)
+		return
+	}
+
+	posKey, err := pgn.ParsePackedPosition(parts[2])
+	if err != nil {
+		http.Error(w, "invalid position key: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Unpack to get FEN
+	pos := posKey.Unpack()
+	if pos == nil {
+		http.Error(w, "failed to unpack position", http.StatusBadRequest)
+		return
+	}
+
+	resp := PositionStatsResponse{
+		Position: posKey.String(),
+		FEN:      pos.ToFEN(),
+	}
+
+	// Get position record directly by key
+	var timing store.GetTiming
+	var rec *store.PositionRecord
+	if timedStore, ok := h.ps.(store.TimedStore); ok {
+		rec, timing = timedStore.GetWithTiming(posKey)
+	} else {
+		rec, err = h.ps.Get(posKey)
+		if err != nil && err != store.ErrPSKeyNotFound {
+			h.log.Error().Err(err).Str("rid", GetRequestID(r.Context())).Msg("get position stats")
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if rec != nil {
+		resp.Wins = uint32(rec.Wins)
+		resp.Draws = uint32(rec.Draws)
+		resp.Losses = uint32(rec.Losses)
+		resp.Count = resp.Wins + resp.Draws + resp.Losses
+		if resp.Count > 0 {
+			resp.WinPct = float64(resp.Wins) / float64(resp.Count) * 100
+			resp.DrawPct = float64(resp.Draws) / float64(resp.Count) * 100
+		}
+		resp.CP = rec.CP
+		resp.ProvenDepth = rec.ProvenDepth
+		resp.HasEval = rec.HasCP() || rec.DTM != store.DTMUnknown
+
+		if rec.DTM != store.DTMUnknown {
+			kind, dist := store.DecodeDTM(rec.DTM)
+			if kind == store.MateWin {
+				resp.DTM = int16(dist)
+			} else if kind == store.MateLoss {
+				resp.DTM = int16(-dist)
+			}
+		}
+
+		// Queue for eval if no eval yet
+		if !resp.HasEval && h.evalPool != nil {
+			h.evalPool.EnqueueBrowse(posKey)
+		}
+	}
+
+	elapsed := time.Since(start)
+
+	// Add Server-Timing header
+	w.Header().Set("Server-Timing", fmt.Sprintf(
+		"total;dur=%.3f, memtable;dur=%.3f, l0;dur=%.3f, l1;dur=%.3f",
+		float64(elapsed.Microseconds())/1000,
+		float64(timing.Memtable.Microseconds())/1000,
+		float64(timing.L0.Microseconds())/1000,
+		float64(timing.L1.Microseconds())/1000,
+	))
+
+	writeJSON(w, resp)
+}
+
 // TreeNode represents a node in the game tree for the UI
 type TreeNode struct {
 	Position    string      `json:"position"`               // Base64 position key
@@ -246,6 +410,21 @@ type TreeNode struct {
 	Path        []*PathNode `json:"path,omitempty"`         // Path from start (only on root when moves param used)
 }
 
+// TreeResponse is the new tree endpoint response with progressive loading support
+type TreeResponse struct {
+	Root       *TreeNode    `json:"root"`                  // Current position with stats
+	TopMoves   []*TreeNode  `json:"top_moves"`             // Top N moves with full stats
+	OtherMoves []*MoveStub  `json:"other_moves,omitempty"` // Remaining moves (skeleton only)
+	Path       []*PathNode  `json:"path,omitempty"`        // Path from start position
+}
+
+// MoveStub is a skeleton move without stats (for progressive loading)
+type MoveStub struct {
+	Position string `json:"position"` // Base64 position key
+	UCI      string `json:"uci"`      // UCI notation
+	SAN      string `json:"san"`      // SAN notation
+}
+
 // PathNode represents a position in the path from start to current position
 type PathNode struct {
 	Position string `json:"position"`          // Base64 position key
@@ -259,15 +438,9 @@ type PathNode struct {
 	HasEval  bool   `json:"has_eval"`          // Whether position has been evaluated
 }
 
-// TreeRequest specifies what to fetch
-type TreeRequest struct {
-	Depth    int `json:"depth"`     // How many levels deep to fetch (default: 2)
-	TopMoves int `json:"top_moves"` // Top N moves per position (default: 4)
-}
-
 func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	h.log.Info().Str("path", r.URL.Path).Str("query", r.URL.RawQuery).Msg("tree endpoint called")
+	var pathTime, rootTime, movegenTime, lookupTime time.Duration
 
 	parts := splitPath(r.URL.Path)
 
@@ -276,7 +449,12 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 	var pos *pgn.GameState
 	var pathNodes []*PathNode
 
+	// pathEvals controls whether to look up CP/DTM for each position in the path
+	// Default is false to avoid slow lookups for deep positions
+	pathEvals := r.URL.Query().Get("path_evals") == "true"
+
 	// Check for moves parameter first (preferred method - SAN notation)
+	pathStart := time.Now()
 	movesParam := r.URL.Query().Get("moves")
 	if movesParam != "" {
 		// Parse moves and build path
@@ -314,21 +492,23 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 				SAN:      san,
 			}
 
-			// Look up position data (CP/DTM)
-			if record, err := h.ps.Get(posKey); err == nil && record != nil {
-				if record.HasCP() {
-					pathNode.CP = record.CP
-					pathNode.HasEval = true
-				}
-				if record.DTM != store.DTMUnknown {
-					kind, dist := store.DecodeMate(record.DTM)
-					switch kind {
-					case store.MateWin:
-						pathNode.DTM = dist
+			// Look up position data (CP/DTM) - only if pathEvals=true
+			if pathEvals {
+				if record, err := h.ps.Get(posKey); err == nil && record != nil {
+					if record.HasCP() {
+						pathNode.CP = record.CP
 						pathNode.HasEval = true
-					case store.MateLoss:
-						pathNode.DTM = -dist
-						pathNode.HasEval = true
+					}
+					if record.DTM != store.DTMUnknown {
+						kind, dist := store.DecodeMate(record.DTM)
+						switch kind {
+						case store.MateWin:
+							pathNode.DTM = dist
+							pathNode.HasEval = true
+						case store.MateLoss:
+							pathNode.DTM = -dist
+							pathNode.HasEval = true
+						}
 					}
 				}
 			}
@@ -361,51 +541,263 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 		pos = pgn.NewStartingPosition()
 		posKey = pos.Pack()
 	}
-	h.log.Info().Str("fen", pos.ToFEN()).Int("path_len", len(pathNodes)).Msg("parsed position")
+	pathTime = time.Since(pathStart)
 
 	// Parse query params
-	depth := 2
-	topMoves := 4     // Moves per level in tree (for visualization)
-	fetchMoves := 218 // First-level moves to return (for sidebar list)
-	if d := r.URL.Query().Get("depth"); d != "" {
-		if _, err := json.Number(d).Int64(); err == nil {
-			if v, _ := json.Number(d).Int64(); v >= 1 && v <= 5 {
-				depth = int(v)
-			}
-		}
-	}
+	topN := 3 // Number of top moves to return with full stats
 	if t := r.URL.Query().Get("top"); t != "" {
-		if _, err := json.Number(t).Int64(); err == nil {
-			if v, _ := json.Number(t).Int64(); v >= 1 && v <= 10 {
-				topMoves = int(v)
-			}
+		if v, err := json.Number(t).Int64(); err == nil && v >= 1 && v <= 20 {
+			topN = int(v)
 		}
 	}
-	if f := r.URL.Query().Get("fetch"); f != "" {
-		if _, err := json.Number(f).Int64(); err == nil {
-			if v, _ := json.Number(f).Int64(); v >= 1 && v <= 218 {
-				fetchMoves = int(v)
+
+	// Build root node with current position stats
+	rootStart := time.Now()
+	root := h.buildPositionNode(pos, posKey, "", "")
+	rootTime = time.Since(rootStart)
+
+	// Generate all legal moves
+	movegenStart := time.Now()
+	legalMoves := pgn.GenerateLegalMoves(pos)
+
+	// Build move candidates with position keys (fast, no DB lookups yet)
+	type moveCandidate struct {
+		mv       pgn.Mv
+		childKey pgn.PackedPosition
+		san      string
+		uci      string
+		// Filled in by parallel lookup
+		count   uint32
+		wins    uint32
+		draws   uint32
+		losses  uint32
+		cp      int16
+		dtm     int16
+		hasEval bool
+		// Timing for debugging
+		timing store.GetTiming
+	}
+
+	candidates := make([]moveCandidate, 0, len(legalMoves))
+	for _, mv := range legalMoves {
+		childPos := pos.Copy()
+		sanStr := mvToSAN(pos, mv, legalMoves)
+
+		if err := pgn.ApplyMove(childPos, mv); err != nil {
+			continue
+		}
+
+		candidates = append(candidates, moveCandidate{
+			mv:       mv,
+			childKey: childPos.Pack(),
+			san:      sanStr,
+			uci:      moveToUCI(mv),
+		})
+	}
+
+	movegenTime = time.Since(movegenStart)
+
+	// Parallel lookup of position data for all moves
+	// Use GetWithTiming if available to collect timing stats
+	// Always use L2-only mode for tree endpoint (skip memtable/L0/L1)
+	lookupStart := time.Now()
+	timedStore, hasTiming := h.ps.(store.TimedStore)
+
+	var wg sync.WaitGroup
+	for i := range candidates {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			c := &candidates[idx]
+
+			var rec *store.PositionRecord
+			if hasTiming {
+				rec, c.timing = timedStore.GetWithTiming(c.childKey)
+			} else {
+				rec, _ = h.ps.Get(c.childKey)
 			}
+
+			if rec != nil {
+				c.wins = uint32(rec.Wins)
+				c.draws = uint32(rec.Draws)
+				c.losses = uint32(rec.Losses)
+				c.count = c.wins + c.draws + c.losses
+				c.cp = rec.CP
+				c.hasEval = rec.HasCP() || rec.DTM != store.DTMUnknown
+
+				if rec.DTM != store.DTMUnknown {
+					kind, dist := store.DecodeDTM(rec.DTM)
+					if kind == store.MateWin {
+						c.dtm = int16(dist)
+					} else if kind == store.MateLoss {
+						c.dtm = int16(-dist)
+					}
+				}
+
+				// Queue for eval if no eval yet
+				if !c.hasEval && h.evalPool != nil {
+					h.evalPool.EnqueueBrowse(c.childKey)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	lookupTime = time.Since(lookupStart)
+
+	// Aggregate timing stats (L2 only)
+	var totalL2 time.Duration
+	var posCacheHits, posCacheMisses int
+	for _, c := range candidates {
+		totalL2 += c.timing.L2
+		if c.timing.CacheHit {
+			posCacheHits++
+		} else {
+			posCacheMisses++
 		}
 	}
-	h.log.Info().Int("depth", depth).Int("top_moves", topMoves).Int("fetch_moves", fetchMoves).Msg("building tree")
 
-	// Build tree recursively - first level uses fetchMoves, deeper levels use topMoves
-	root := h.buildTreeNode(pos, posKey, "", "", depth, topMoves, fetchMoves, true)
+	// Sort: best CP first (for current side), then by count
+	whiteToMove := pos.SideToMove == pgn.White
+	sort.Slice(candidates, func(i, j int) bool {
+		ci, cj := candidates[i], candidates[j]
+		if ci.hasEval && cj.hasEval {
+			if whiteToMove {
+				return ci.cp > cj.cp
+			}
+			return ci.cp < cj.cp
+		}
+		if ci.hasEval != cj.hasEval {
+			return ci.hasEval
+		}
+		return ci.count > cj.count
+	})
 
-	// Include path if we parsed moves
-	if len(pathNodes) > 0 {
-		root.Path = pathNodes
+	// Split into top moves (with full stats) and other moves (skeleton)
+	resp := TreeResponse{
+		Root:     root,
+		TopMoves: make([]*TreeNode, 0, topN),
+		Path:     pathNodes,
 	}
+
+	for i, c := range candidates {
+		if i < topN {
+			// Top move: include full stats
+			node := &TreeNode{
+				Position: c.childKey.String(),
+				FEN:      c.childKey.Unpack().ToFEN(),
+				UCI:      c.uci,
+				SAN:      c.san,
+				Count:    c.count,
+				Wins:     c.wins,
+				Draws:    c.draws,
+				Losses:   c.losses,
+				CP:       c.cp,
+				DTM:      c.dtm,
+				HasEval:  c.hasEval,
+			}
+			if c.count > 0 {
+				node.WinPct = float64(c.wins) / float64(c.count) * 100
+				node.DrawPct = float64(c.draws) / float64(c.count) * 100
+			}
+			// Look up ECO
+			if h.ecoDB != nil {
+				if opening := h.ecoDB.Lookup(c.childKey); opening != nil {
+					node.ECO = opening.ECO
+					node.Opening = opening.Name
+				}
+			}
+			resp.TopMoves = append(resp.TopMoves, node)
+		} else {
+			// Other move: skeleton only (UI will fetch async)
+			resp.OtherMoves = append(resp.OtherMoves, &MoveStub{
+				Position: c.childKey.String(),
+				UCI:      c.uci,
+				SAN:      c.san,
+			})
+		}
+	}
+
+	elapsed := time.Since(start)
 
 	h.log.Info().
-		Dur("elapsed", time.Since(start)).
-		Int("depth", depth).
-		Int("top_moves", topMoves).
-		Int("fetch_moves", fetchMoves).
-		Msg("tree request completed")
+		Dur("elapsed", elapsed).
+		Dur("path", pathTime).
+		Dur("root", rootTime).
+		Dur("movegen", movegenTime).
+		Dur("lookup", lookupTime).
+		Dur("l2", totalL2).
+		Int("moves", len(candidates)).
+		Int("cache_hits", posCacheHits).
+		Int("cache_misses", posCacheMisses).
+		Msg("tree")
 
-	writeJSON(w, root)
+	// Add Server-Timing header
+	w.Header().Set("Server-Timing", fmt.Sprintf(
+		"total;dur=%.3f, path;dur=%.3f, root;dur=%.3f, movegen;dur=%.3f, lookup;dur=%.3f, l2;dur=%.3f",
+		float64(elapsed.Microseconds())/1000,
+		float64(pathTime.Microseconds())/1000,
+		float64(rootTime.Microseconds())/1000,
+		float64(movegenTime.Microseconds())/1000,
+		float64(lookupTime.Microseconds())/1000,
+		float64(totalL2.Microseconds())/1000,
+	))
+
+	writeJSON(w, resp)
+}
+
+// buildPositionNode creates a TreeNode for a position (no children)
+func (h *Handler) buildPositionNode(pos *pgn.GameState, posKey pgn.PackedPosition, uci, san string) *TreeNode {
+	node := &TreeNode{
+		Position: posKey.String(),
+		FEN:      pos.ToFEN(),
+		UCI:      uci,
+		SAN:      san,
+	}
+
+	// Look up ECO opening
+	if h.ecoDB != nil {
+		if opening := h.ecoDB.Lookup(posKey); opening != nil {
+			node.ECO = opening.ECO
+			node.Opening = opening.Name
+		}
+	}
+
+	// Get position record
+	var rec *store.PositionRecord
+	if timedStore, ok := h.ps.(store.TimedStore); ok {
+		rec, _ = timedStore.GetWithTiming(posKey)
+	} else {
+		rec, _ = h.ps.Get(posKey)
+	}
+	if rec != nil {
+		node.Wins = uint32(rec.Wins)
+		node.Draws = uint32(rec.Draws)
+		node.Losses = uint32(rec.Losses)
+		node.Count = node.Wins + node.Draws + node.Losses
+		if node.Count > 0 {
+			node.WinPct = float64(node.Wins) / float64(node.Count) * 100
+			node.DrawPct = float64(node.Draws) / float64(node.Count) * 100
+		}
+		node.CP = rec.CP
+		node.ProvenDepth = rec.ProvenDepth
+		node.HasEval = rec.HasCP() || rec.DTM != store.DTMUnknown
+
+		if rec.DTM != store.DTMUnknown {
+			kind, dist := store.DecodeDTM(rec.DTM)
+			if kind == store.MateWin {
+				node.DTM = int16(dist)
+			} else if kind == store.MateLoss {
+				node.DTM = int16(-dist)
+			}
+		}
+
+		// Queue for eval if no eval yet
+		if !node.HasEval && h.evalPool != nil {
+			h.evalPool.EnqueueBrowse(posKey)
+		}
+	}
+
+	return node
 }
 
 // mvToUCI converts a move to UCI notation
@@ -431,165 +823,6 @@ func mvToUCI(mv pgn.Mv) string {
 	}
 
 	return uci
-}
-
-func (h *Handler) buildTreeNode(pos *pgn.GameState, posKey pgn.PackedPosition, uci, san string, depth, topMoves, fetchMoves int, isRoot bool) *TreeNode {
-	node := &TreeNode{
-		Position: posKey.String(),
-		FEN:      pos.ToFEN(),
-		UCI:      uci,
-		SAN:      san,
-	}
-
-	// Look up ECO opening
-	if h.ecoDB != nil {
-		if opening := h.ecoDB.Lookup(posKey); opening != nil {
-			node.ECO = opening.ECO
-			node.Opening = opening.Name
-		}
-	}
-
-	// Get position record directly by key
-	rec, err := h.ps.Get(posKey)
-	if err == nil && rec != nil {
-		node.Wins = uint32(rec.Wins)
-		node.Draws = uint32(rec.Draws)
-		node.Losses = uint32(rec.Losses)
-		node.Count = node.Wins + node.Draws + node.Losses
-		if node.Count > 0 {
-			node.WinPct = float64(node.Wins) / float64(node.Count) * 100
-			node.DrawPct = float64(node.Draws) / float64(node.Count) * 100
-		}
-		node.CP = rec.CP
-		node.ProvenDepth = rec.ProvenDepth
-
-		if rec.DTM != store.DTMUnknown {
-			kind, dist := store.DecodeDTM(rec.DTM)
-			if kind == store.MateWin {
-				node.DTM = int16(dist)
-			} else if kind == store.MateLoss {
-				node.DTM = int16(-dist)
-			}
-		}
-
-		// If position has no eval (CP unknown and no DTM), queue it for evaluation
-		hasEval := rec.HasCP() || rec.DTM != store.DTMUnknown
-		node.HasEval = hasEval
-		if !hasEval && h.evalPool != nil {
-			added := h.evalPool.EnqueueBrowse(posKey)
-			if added {
-				h.log.Debug().Str("fen", node.FEN).Uint32("count", node.Count).Msg("queued position for browse eval")
-			}
-		}
-	}
-
-	// If we need children, generate them
-	if depth > 0 {
-		moves := pgn.GenerateLegalMoves(pos)
-
-		// First pass: get counts and CP for all moves (no recursion yet)
-		type moveCandidate struct {
-			mv       pgn.Mv
-			childPos *pgn.GameState
-			childKey pgn.PackedPosition
-			san      string
-			uci      string
-			count    uint32
-			cp       int16
-			hasEval  bool
-		}
-
-		// Pre-allocate candidates and prepare moves (single-threaded, fast)
-		candidates := make([]moveCandidate, 0, len(moves))
-		for _, mv := range moves {
-			childPos := pos.Copy()
-			sanStr := mvToSAN(pos, mv, moves)
-
-			if err := pgn.ApplyMove(childPos, mv); err != nil {
-				continue
-			}
-
-			candidates = append(candidates, moveCandidate{
-				mv:       mv,
-				childPos: childPos,
-				childKey: childPos.Pack(),
-				san:      sanStr,
-				uci:      moveToUCI(mv),
-			})
-		}
-
-		// Parallel lookup of position data (the slow part)
-		var wg sync.WaitGroup
-		for i := range candidates {
-			wg.Add(1)
-			go func(idx int) {
-				defer wg.Done()
-				c := &candidates[idx]
-				if childRec, err := h.ps.Get(c.childKey); err == nil && childRec != nil {
-					c.count = uint32(childRec.Wins) + uint32(childRec.Draws) + uint32(childRec.Losses)
-					c.cp = childRec.CP
-					c.hasEval = childRec.HasCP() || childRec.DTM != store.DTMUnknown
-
-					// Queue for eval if no eval yet
-					if !c.hasEval && h.evalPool != nil {
-						h.evalPool.EnqueueBrowse(c.childKey)
-					}
-				}
-			}(i)
-		}
-		wg.Wait()
-
-		// Determine if white is to move (affects sort direction)
-		// CP is stored from white's perspective:
-		// - White wants highest CP (best for white)
-		// - Black wants lowest CP (best for black)
-		whiteToMove := pos.SideToMove == pgn.White
-
-		// Sort by CP: best for current side first
-		// Positions without eval go to the end, sorted by count
-		sort.Slice(candidates, func(i, j int) bool {
-			ci, cj := candidates[i], candidates[j]
-
-			if ci.hasEval && cj.hasEval {
-				// Both have eval: sort by CP
-				if whiteToMove {
-					return ci.cp > cj.cp // White wants highest CP first
-				}
-				return ci.cp < cj.cp // Black wants lowest CP first
-			}
-			if ci.hasEval != cj.hasEval {
-				// Prefer positions with eval
-				return ci.hasEval
-			}
-			// Neither has eval: sort by count (descending)
-			return ci.count > cj.count
-		})
-
-		// Take top N BEFORE recursing
-		// At root level, use fetchMoves (for sidebar list)
-		// At deeper levels, use topMoves (for tree visualization)
-		limit := topMoves
-		if isRoot {
-			limit = fetchMoves
-		}
-		if len(candidates) > limit {
-			candidates = candidates[:limit]
-		}
-
-		// Now recursively build only the top candidates (in parallel)
-		node.Children = make([]*TreeNode, len(candidates))
-		var childWg sync.WaitGroup
-		for i, c := range candidates {
-			childWg.Add(1)
-			go func(idx int, cand moveCandidate) {
-				defer childWg.Done()
-				node.Children[idx] = h.buildTreeNode(cand.childPos, cand.childKey, cand.uci, cand.san, depth-1, topMoves, fetchMoves, false)
-			}(i, c)
-		}
-		childWg.Wait()
-	}
-
-	return node
 }
 
 // mvToSAN converts a move to SAN notation
@@ -759,6 +992,234 @@ func (h *Handler) evalWorkers(w http.ResponseWriter, r *http.Request) {
 		"active_workers": newCount,
 		"max_workers":    h.evalPool.GetStatus().MaxWorkers,
 	})
+}
+
+// DeepEvalResponse is the response from the deep-eval endpoint
+type DeepEvalResponse struct {
+	RootPosition string `json:"root_position"`
+	Queued       int    `json:"queued"`
+	Depth        int    `json:"depth"`
+	TopMoves     int    `json:"top_moves"`
+}
+
+// deepEval uses Stockfish MultiPV to find top moves and stores their evaluations.
+// Runs asynchronously - returns immediately with "queued" status.
+// Goes N levels deep, following only top M moves at each level.
+// Uses time-limited search (5 sec per position) and stores CP values directly.
+func (h *Handler) deepEval(w http.ResponseWriter, r *http.Request) {
+	if h.evalPool == nil {
+		http.Error(w, "eval pool not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	parts := splitPath(r.URL.Path)
+	if len(parts) < 3 {
+		http.Error(w, "missing position key", http.StatusBadRequest)
+		return
+	}
+
+	var posKey pgn.PackedPosition
+	var pos *pgn.GameState
+	var err error
+
+	if parts[2] == "start" {
+		pos = pgn.NewStartingPosition()
+		posKey = pos.Pack()
+	} else {
+		posKey, err = pgn.ParsePackedPosition(parts[2])
+		if err != nil {
+			http.Error(w, "invalid position key: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		pos = posKey.Unpack()
+		if pos == nil {
+			http.Error(w, "failed to unpack position", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Get the WriteStore interface for storing evaluations
+	ws, ok := h.ps.(store.WriteStore)
+	if !ok {
+		http.Error(w, "store is read-only", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Configuration
+	maxDepth := 6 // How many levels deep to explore
+	topMoves := 5 // Top N moves to follow at each level
+
+	// Return immediately - work happens in background
+	h.log.Info().
+		Str("root", posKey.String()).
+		Int("depth", maxDepth).
+		Int("top_moves", topMoves).
+		Msg("deep eval queued")
+
+	writeJSON(w, DeepEvalResponse{
+		RootPosition: posKey.String(),
+		Queued:       1, // Will expand in background
+		Depth:        maxDepth,
+		TopMoves:     topMoves,
+	})
+
+	// Run BFS in background goroutine
+	go h.runDeepEvalBFS(pos, posKey, ws, maxDepth, topMoves)
+}
+
+// runDeepEvalBFS runs the deep evaluation BFS in the background.
+func (h *Handler) runDeepEvalBFS(pos *pgn.GameState, posKey pgn.PackedPosition, ws store.WriteStore, maxDepth, topMoves int) {
+	searchDepth := 30 // Used for ProvenDepth field
+
+	// BFS queue: each entry is (position, depth)
+	type bfsEntry struct {
+		pos   *pgn.GameState
+		key   pgn.PackedPosition
+		depth int
+	}
+
+	queued := 0
+	evaluated := 0
+	seen := make(map[string]bool) // Avoid duplicate positions
+	queue := []bfsEntry{{pos: pos, key: posKey, depth: 0}}
+
+	// BFS up to maxDepth levels, following only top moves
+	for len(queue) > 0 {
+		entry := queue[0]
+		queue = queue[1:]
+
+		// Skip if already seen
+		keyStr := entry.key.String()
+		if seen[keyStr] {
+			continue
+		}
+		seen[keyStr] = true
+		queued++
+
+		// Stop expanding at maxDepth
+		if entry.depth >= maxDepth {
+			continue
+		}
+
+		// Use Stockfish MultiPV to find top moves with evaluations
+		fen := entry.pos.ToFEN()
+		topMovesWithScores, err := h.evalPool.AnalyzeTopMoves(fen, topMoves, searchDepth)
+		if err != nil {
+			h.log.Warn().Err(err).Str("fen", fen).Msg("deep-eval: failed to analyze position")
+			continue
+		}
+		if len(topMovesWithScores) == 0 {
+			h.log.Warn().Str("fen", fen).Msg("deep-eval: AnalyzeTopMoves returned no moves")
+			continue
+		}
+		h.log.Debug().Str("fen", fen).Int("depth", entry.depth).Int("moves", len(topMovesWithScores)).Msg("deep-eval: analyzed")
+
+		// Apply each top move, store eval, and add to queue
+		for _, ms := range topMovesWithScores {
+			childPos := entry.pos.Copy()
+			if err := applyUCIMove(childPos, ms.UCI); err != nil {
+				continue
+			}
+			childKey := childPos.Pack()
+
+			// Store the evaluation for this child position
+			// Score is from side-to-move's perspective, normalize to white's perspective
+			// Get() checks L2 + eval cache, so we skip positions already evaluated
+			rec, _ := ws.Get(childKey)
+			if rec == nil {
+				rec = &store.PositionRecord{}
+			}
+
+			// Only update if not already evaluated
+			if !rec.HasCP() && rec.DTM == store.DTMUnknown {
+				// Score from Stockfish is from parent's side-to-move perspective.
+				// If child is white to move, parent was black to move, so flip to normalize.
+				whiteToMoveInChild := childPos.SideToMove == pgn.White
+				if ms.Mate != 0 {
+					// Store mate score
+					mate := int(ms.Mate)
+					if whiteToMoveInChild {
+						mate = -mate
+					}
+					rec.DTM = store.EncodeMate(mate)
+				} else {
+					// Store CP score (normalize to white's perspective)
+					cp := ms.Score
+					if whiteToMoveInChild {
+						cp = -cp
+					}
+					rec.CP = cp
+					rec.SetHasCP(true)
+				}
+				rec.SetProvenDepth(uint16(searchDepth))
+
+				if err := ws.Put(childKey, rec); err != nil {
+					h.log.Warn().Err(err).Str("fen", childPos.ToFEN()).Msg("deep-eval: failed to store eval")
+				} else {
+					evaluated++
+					// Log evaluation to CSV (same as regular eval workers)
+					h.evalPool.LogEval(childPos.ToFEN(), childKey, rec)
+				}
+			}
+
+			queue = append(queue, bfsEntry{
+				pos:   childPos,
+				key:   childKey,
+				depth: entry.depth + 1,
+			})
+		}
+	}
+
+	h.log.Info().
+		Str("root", posKey.String()).
+		Int("queued", queued).
+		Int("evaluated", evaluated).
+		Int("depth", maxDepth).
+		Int("top_moves", topMoves).
+		Msg("deep-eval complete")
+}
+
+// applyUCIMove applies a UCI move (e.g., "e2e4", "e7e8q") to a position
+func applyUCIMove(pos *pgn.GameState, uci string) error {
+	if len(uci) < 4 {
+		return fmt.Errorf("invalid UCI move: %s", uci)
+	}
+
+	fromFile := int(uci[0] - 'a')
+	fromRank := int(uci[1] - '1')
+	toFile := int(uci[2] - 'a')
+	toRank := int(uci[3] - '1')
+
+	from := pgn.Square(fromRank*8 + fromFile)
+	to := pgn.Square(toRank*8 + toFile)
+
+	// Find matching legal move
+	moves := pgn.GenerateLegalMoves(pos)
+	for _, mv := range moves {
+		if mv.From == from && mv.To == to {
+			// Check promotion if specified
+			if len(uci) == 5 {
+				promo := uci[4]
+				var expectedPromo pgn.PromoPiece
+				switch promo {
+				case 'q':
+					expectedPromo = pgn.PromoQueen
+				case 'r':
+					expectedPromo = pgn.PromoRook
+				case 'b':
+					expectedPromo = pgn.PromoBishop
+				case 'n':
+					expectedPromo = pgn.PromoKnight
+				}
+				if mv.Promo != expectedPromo {
+					continue
+				}
+			}
+			return pgn.ApplyMove(pos, mv)
+		}
+	}
+
+	return fmt.Errorf("no legal move matches UCI: %s", uci)
 }
 
 // writeJSON writes a JSON response

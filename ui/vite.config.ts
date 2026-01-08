@@ -9,6 +9,7 @@ export default defineConfig({
       '/v1': {
         target: 'http://localhost:8007',
         changeOrigin: true,
+        timeout: 300000, // 5 minutes
       },
     },
   },

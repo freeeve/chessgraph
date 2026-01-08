@@ -73,18 +73,23 @@ func main() {
 		evalHash      = flag.Int("eval-hash", 512, "Stockfish hash MB per worker")
 		evalWorkers   = flag.Int("eval-workers", 1, "number of eval workers to run")
 		evalNice      = flag.Int("eval-nice", 0, "nice value for Stockfish processes (0=disabled)")
+		evalLog       = flag.String("eval-log", "./data/eval-log.csv.zst", "CSV file for logging evaluations, zstd compressed (empty=disabled)")
 		badThreshold  = flag.Int("bad-threshold", -300, "CP threshold for losing positions")
 		goodThreshold = flag.Int("good-threshold", 300, "CP threshold for winning positions")
 
 		// Ingest settings
-		ingestDir    = flag.String("ingest-dir", "", "Directory to watch for PGN files (empty = disabled)")
-		ingestRating = flag.Int("ingest-rating", 2000, "Minimum rating for ingested games")
+		ingestDir     = flag.String("ingest-dir", "", "Directory to watch for PGN files (empty = disabled)")
+		ingestRating  = flag.Int("ingest-rating", 2000, "Minimum rating for ingested games")
+		ingestWorkers = flag.Int("ingest-workers", 0, "Number of ingest workers (0 = NumCPU)")
 
 		// ECO settings
 		ecoDir = flag.String("eco-dir", "./data/eco", "Directory containing ECO .tsv files")
 
-		// Memory settings
-		dirtyLimit = flag.String("dirty-limit", "4g", "Memory limit for dirty blocks (e.g., 512m, 4g)")
+		// Compression settings
+		l2Compression = flag.String("l2-compression", "fast", "L2 compression level: 'fast' or 'best'")
+
+		// Position cache settings
+		posCacheSize = flag.String("pos-cache", "256m", "Position cache size (e.g., 2g, 512m). 0 = disabled")
 	)
 	flag.Parse()
 
@@ -92,15 +97,16 @@ func main() {
 		*stockfishPath = envPath
 	}
 
-	// Parse dirty memory limit early (needed for eval pool)
-	dirtyMemLimit := parseSize(*dirtyLimit)
+	posCacheBytes := parseSize(*posCacheSize)
 
 	logger := logx.NewLogger()
 
 	// Open V12 position store
 	v12, err := store.NewV12Store(store.V12StoreConfig{
-		Dir: *positionStoreDir,
-		// MemtableSize defaults to 512MB, NumWorkers defaults to runtime.NumCPU()
+		Dir:                *positionStoreDir,
+		PositionCacheBytes: posCacheBytes,
+		NumWorkers:         *ingestWorkers, // 0 = NumCPU
+		L2Compression:      *l2Compression,
 	})
 	if err != nil {
 		logger.Fatal().Err(err).Msg("open v12 store")
@@ -116,6 +122,12 @@ func main() {
 	var ingestStore store.IngestStore = v12
 
 	logger.Info().Str("dir", *positionStoreDir).Msg("opened V12 store")
+
+	if posCacheBytes > 0 {
+		logger.Info().
+			Int64("bytes", posCacheBytes).
+			Msg("position cache enabled")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -140,15 +152,17 @@ func main() {
 			HashMB:          *evalHash,
 			Threads:         *evalThreads,
 			Nice:            *evalNice,
-			NumWorkers:      *evalWorkers,
-			QueueSize:       *batchSize * 10,
-			MaxDepth:        20,
-			RefutationOnly:  !*evalWorker, // Skip DFS if only doing refutation
-			DirtyMemLimit:   dirtyMemLimit,
+			NumWorkers:     *evalWorkers,
+			QueueSize:      *batchSize * 10,
+			MaxDepth:       20,
+			RefutationOnly: !*evalWorker, // Skip DFS if only doing refutation
+			EvalLogPath:    *evalLog,
 		}, writeStore)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("create eval pool")
 		}
+		// Share eval cache with store for fast eval lookups
+		v12.SetEvalCache(evalPool.EvalCache())
 	}
 
 	// Load ECO opening database
@@ -193,16 +207,12 @@ func main() {
 	// Start ingest worker if configured
 	if *ingestDir != "" {
 		cfg := ingest.Config{
-			WatchDir:      *ingestDir,
-			RatingMin:     *ingestRating,
-			DirtyMemLimit: dirtyMemLimit,
-			Logger:        logger.With().Str("component", "ingest").Logger(),
+			WatchDir:  *ingestDir,
+			RatingMin: *ingestRating,
+			Logger:    logger.With().Str("component", "ingest").Logger(),
 			// CheckFlushEvery defaults to 100 games
 		}
-		// Pause eval pool and scanner during ingest to reduce contention
-		if evalPool != nil {
-			cfg.PauseDuring = append(cfg.PauseDuring, evalPool)
-		}
+		// Pause scanner during ingest to reduce contention (eval pool continues)
 		if scanner != nil {
 			cfg.PauseDuring = append(cfg.PauseDuring, scanner)
 		}
@@ -211,6 +221,8 @@ func main() {
 			logger.Fatal().Err(err).Msg("create ingest worker")
 		}
 		if worker != nil {
+			// Start background compaction during ingestion (every 30 seconds)
+			v12.StartBackgroundCompaction(30 * time.Second)
 			go func() {
 				if err := worker.Run(ctx); err != nil && err != context.Canceled {
 					logger.Error().Err(err).Msg("ingest worker stopped")
@@ -218,7 +230,6 @@ func main() {
 			}()
 			logger.Info().
 				Str("watch_dir", *ingestDir).
-				Int64("dirty_limit_bytes", dirtyMemLimit).
 				Msg("started ingest worker")
 		}
 	}
@@ -250,6 +261,9 @@ func main() {
 	<-ctx.Done()
 	logger.Info().Msg("shutting down...")
 
+	// Stop background compaction first
+	v12.StopBackgroundCompaction()
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -259,6 +273,7 @@ func main() {
 	}
 
 	// Give workers a moment to finish their current work
+	// (eval pool Run() will close the eval log after workers stop)
 	time.Sleep(1 * time.Second)
 
 	// Flush position store to ensure all dirty blocks are written
@@ -272,6 +287,9 @@ func main() {
 			Uint64("writes", stats.TotalWrites).
 			Msg("position store flushed successfully")
 	}
+
+	// Skip L0→L1 compaction on shutdown - background compaction handles it during runtime
+	// and we don't want to block shutdown waiting for a long compaction
 
 	logger.Info().Msg("shutdown complete")
 }
